@@ -35,6 +35,7 @@ LOG_DIR = _env_path("KT_LOG_DIR", ROOT / "logs")
 VAR_DIR = _env_path("KT_VAR_DIR", ROOT / "var")
 TOKEN_PATH = _env_path("KT_CLIENT_TOKEN_FILE", ROOT / "client-token.txt")
 DB_PATH = DATA_DIR / "fleet.sqlite"
+SYNC_DB_PATH = DATA_DIR / "sync.sqlite"
 
 FUTAR_BASE = "https://futar.bkk.hu/api/query/v1/ws/otp/api/where/"
 GTFSRT_BASE = "https://go.bkk.hu/api/query/v1/ws/gtfs-rt/full/"
@@ -68,6 +69,17 @@ TTL_BY_ENDPOINT = {
     "gtfs-rt": 60,
 }
 
+# Eszközszinkron (bejelentkezés nélkül): a kliens véletlen szinkron-azonosítója + a kliens token.
+SYNC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+SYNC_KEY_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+SYNC_PATH_RE = re.compile(r"/sync/[^/?#\s]+")
+SYNC_MAX_BYTES = int(os.environ.get("KT_SYNC_MAX_BYTES", "262144"))   # egy dokumentum, JSON
+SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulcs értéke
+SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
+SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
+SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync"]
+
 SECRET_PARAM_RE = re.compile(r"(?i)(key|token|apikey|api_key)=[^&\s]*")
 SAFE_EP_RE = re.compile(r"^[a-z0-9_\-]+\.(json|pb)$")
 SAFE_RT_RE = re.compile(r"^[A-Za-z0-9_\-]+(?:\.pb)?$")
@@ -93,6 +105,7 @@ def redact(s: str) -> str:
         s = s.replace(token, "[redacted]")
         s = s.replace(urllib.parse.quote(token, safe=""), "[redacted]")
     s = SECRET_PARAM_RE.sub(r"\1=[redacted]", s)
+    s = SYNC_PATH_RE.sub("/sync/[id]", s)
     return s
 
 
@@ -505,7 +518,101 @@ class State:
         return POLL_ACTIVE_SEC if self.last_client_age() <= IDLE_AFTER_SEC else POLL_IDLE_SEC
 
 
+class SyncError(Exception):
+    def __init__(self, code: int, status: str, text: str) -> None:
+        super().__init__(text)
+        self.code = code
+        self.status = status
+        self.text = text
+
+
+class SyncStore:
+    """Kulcsonkénti last-write-wins tár: {kulcs: {"v": str|None, "ts": ms}}. Külön SQLite-fájl."""
+
+    def __init__(self, path: Path) -> None:
+        self.lock = threading.Lock()
+        self.last_put: dict[str, float] = {}
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS sync_doc (id TEXT PRIMARY KEY, data TEXT NOT NULL, rev INTEGER NOT NULL, "
+            "updated INTEGER NOT NULL, size INTEGER NOT NULL)"
+        )
+        self.conn.commit()
+
+    def _load(self, sid: str) -> tuple[int, dict[str, Any], int]:
+        row = self.conn.execute("SELECT data, rev, updated FROM sync_doc WHERE id=?", (sid,)).fetchone()
+        if not row:
+            return 0, {}, 0
+        try:
+            data = json.loads(row[0])
+        except Exception:
+            data = {}
+        return int(row[1]), data if isinstance(data, dict) else {}, int(row[2])
+
+    def get(self, sid: str) -> tuple[int, dict[str, Any], int]:
+        with self.lock:
+            return self._load(sid)
+
+    def merge(self, sid: str, incoming: Any) -> tuple[int, dict[str, Any], list[str]]:
+        if not isinstance(incoming, dict):
+            raise SyncError(400, "ERROR", "data must be an object")
+        t_now = now_ms()
+        with self.lock:
+            last = self.last_put.get(sid, 0.0)
+            if now() - last < SYNC_MIN_GAP_SEC:
+                raise SyncError(429, "RATE_LIMIT", "too many writes")
+            rev, data, _ = self._load(sid)
+            if rev == 0:
+                n = self.conn.execute("SELECT COUNT(*) FROM sync_doc").fetchone()[0]
+                if n >= SYNC_MAX_DOCS:
+                    raise SyncError(507, "FULL", "too many sync documents")
+            changed: list[str] = []
+            for k, e in incoming.items():
+                if not isinstance(k, str) or not SYNC_KEY_RE.match(k):
+                    raise SyncError(400, "ERROR", "invalid key")
+                if not isinstance(e, dict):
+                    raise SyncError(400, "ERROR", "invalid entry")
+                v = e.get("v")
+                ts = e.get("ts")
+                if v is not None and not isinstance(v, str):
+                    raise SyncError(400, "ERROR", "value must be string or null")
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                    raise SyncError(400, "ERROR", "ts must be a number")
+                if v is not None and len(v.encode("utf-8")) > SYNC_MAX_VALUE:
+                    raise SyncError(413, "TOO_LARGE", "value too large")
+                ts = int(min(ts, t_now + 5000))  # jövőbeli időbélyeg nem zárhatja le a kulcsot
+                cur = data.get(k)
+                cur_ts = int(cur.get("ts") or 0) if isinstance(cur, dict) else -1
+                if ts > cur_ts:
+                    if isinstance(cur, dict) and cur.get("v") == v:
+                        data[k] = {"v": v, "ts": ts}
+                        continue
+                    data[k] = {"v": v, "ts": ts}
+                    changed.append(k)
+            if len(data) > SYNC_MAX_KEYS:
+                raise SyncError(413, "TOO_LARGE", "too many keys")
+            raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            if len(raw.encode("utf-8")) > SYNC_MAX_BYTES:
+                raise SyncError(413, "TOO_LARGE", "document too large")
+            self.last_put[sid] = now()
+            if len(self.last_put) > 2000:
+                for x in sorted(self.last_put, key=self.last_put.get)[:1000]:
+                    self.last_put.pop(x, None)
+            if changed or rev == 0:
+                rev += 1
+            self.conn.execute(
+                "INSERT INTO sync_doc(id,data,rev,updated,size) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET data=excluded.data, rev=excluded.rev, updated=excluded.updated, size=excluded.size",
+                (sid, raw, rev, t_now, len(raw)),
+            )
+            self.conn.commit()
+            return rev, data, changed
+
+
 STATE: Optional[State] = None
+SYNC: Optional[SyncStore] = None
 
 
 def bkk_get_json(endpoint: str, params: dict[str, list[str]]) -> tuple[int, Any]:
@@ -1181,7 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin in allowed:
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
             "X-KT-Token, X-KT-Client, Authorization, Content-Type, Accept",
@@ -1212,7 +1319,14 @@ class Handler(BaseHTTPRequestHandler):
             sp = path
             if path.startswith("/api/"):
                 sp = path.rsplit("/", 1)[-1] or path
+            elif path.startswith("/sync/"):
+                sp = "/sync"
             STATE.stats.add_client(sp, cid)
+
+            if path == "/auth":
+                return self._send_json(200, {"status": "OK", "now": now_ms(), "features": SERVER_FEATURES})
+            if path.startswith("/sync/"):
+                return self._sync_get(path[len("/sync/"):], params)
 
             if path == "/stats":
                 return self._send_stats()
@@ -1234,6 +1348,68 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"status": "ERROR", "text": "internal error"})
             except Exception:
                 pass
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._write()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._write()
+
+    def _write(self) -> None:
+        assert STATE is not None
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            params = parse_qs_multi(parsed.query or "")
+            try:
+                n = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                n = -1
+            if n < 0 or n > SYNC_MAX_BYTES + 8192:
+                self.close_connection = True
+                return self._send_json(413, {"status": "TOO_LARGE", "text": "body too large"})
+            raw = self.rfile.read(n) if n else b""
+            tok = extract_token(self, params)
+            if not authorized(tok):
+                return self._send_json(401, {"status": "UNAUTHORIZED", "text": "missing or invalid token"})
+            if not path.startswith("/sync/"):
+                return self._send_json(404, {"status": "NOT_FOUND", "text": "unknown path"})
+            STATE.mark_client()
+            STATE.stats.add_client("/sync:put", client_id_of(self))
+            sid = path[len("/sync/"):]
+            if not SYNC_ID_RE.match(sid):
+                return self._send_json(400, {"status": "ERROR", "text": "invalid sync id"})
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                return self._send_json(400, {"status": "ERROR", "text": "invalid json"})
+            if not isinstance(body, dict):
+                return self._send_json(400, {"status": "ERROR", "text": "invalid json"})
+            assert SYNC is not None
+            try:
+                rev, data, changed = SYNC.merge(sid, body.get("data"))
+            except SyncError as e:
+                return self._send_json(e.code, {"status": e.status, "text": e.text, "now": now_ms()})
+            self._send_json(200, {"status": "OK", "rev": rev, "now": now_ms(), "changed": changed, "data": data})
+        except Exception:
+            log("handler_error " + redact(traceback.format_exc().splitlines()[-1]))
+            try:
+                self._send_json(500, {"status": "ERROR", "text": "internal error"})
+            except Exception:
+                pass
+
+    def _sync_get(self, sid: str, params: dict[str, list[str]]) -> None:
+        if not SYNC_ID_RE.match(sid):
+            return self._send_json(400, {"status": "ERROR", "text": "invalid sync id"})
+        assert SYNC is not None
+        rev, data, updated = SYNC.get(sid)
+        try:
+            known = int(first(params, "rev") or "-1")
+        except ValueError:
+            known = -1
+        if rev and known == rev:
+            return self._send_json(200, {"status": "OK", "rev": rev, "now": now_ms(), "unchanged": True})
+        self._send_json(200, {"status": "OK", "rev": rev, "now": now_ms(), "updated": updated or None, "data": data})
 
     def _send(self, code: int, body: bytes, ctype: str, extra: Optional[dict[str, str]] = None) -> None:
         self.send_response(code)
@@ -1274,6 +1450,7 @@ class Handler(BaseHTTPRequestHandler):
                 "poll_interval_sec": STATE.poll_interval,
                 "backoff": bo,
                 "key_configured": bool(STATE.api_key),
+                "features": SERVER_FEATURES,
             },
         )
 
@@ -1471,7 +1648,7 @@ def match_gtfsrt(path: str) -> Optional[str]:
 
 
 def main() -> int:
-    global STATE
+    global STATE, SYNC
     ensure_dirs()
     if is_mock() and not (os.environ.get("BKK_API_KEY") or "").strip():
         os.environ["BKK_API_KEY"] = "KTMOCK"
@@ -1482,6 +1659,7 @@ def main() -> int:
     STATE = State()
     if not STATE.api_key:
         return 2
+    SYNC = SyncStore(SYNC_DB_PATH)
     log("start bind=%s:%s poll_active=%s poll_idle=%s mock=%s" % (BIND, PORT, POLL_ACTIVE_SEC, POLL_IDLE_SEC, is_mock()))
     # pid
     try:
@@ -1503,6 +1681,11 @@ def main() -> int:
         httpd.server_close()
         try:
             STATE.db.close()
+        except Exception:
+            pass
+        try:
+            if SYNC is not None:
+                SYNC.conn.close()
         except Exception:
             pass
         log("stopped")
