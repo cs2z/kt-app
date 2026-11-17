@@ -1,0 +1,9 @@
+[Unit]
+Description=KT szerver frissítése GitHubról (server/ könyvtár)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kt-update
+Nice=10

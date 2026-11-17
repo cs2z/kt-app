@@ -1,0 +1,25 @@
+[Unit]
+Description=KT FUTÁR köztes proxy és flotta-gyorsítótár
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kt
+Group=kt
+EnvironmentFile=/etc/kt-server/env
+WorkingDirectory=/var/lib/kt-server
+ExecStart=/var/lib/kt-server/venv/bin/python3 -u /opt/kt-app/server/server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/kt-server /var/log/kt-server
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

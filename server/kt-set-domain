@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# KT Caddy-hoszt beállítása. Használat: sudo kt-set-domain ktbp.hu
+# Az /etc/kt-server/env KT_HOST értékét írja, a Caddyfile-t újragenerálja, majd reload.
+set -euo pipefail
+
+ENV_FILE="${KT_ENV_FILE:-/etc/kt-server/env}"
+CADDY_FILE="${KT_CADDY_FILE:-/etc/caddy/Caddyfile}"
+DEFAULT_EXTRA="185-208-226-186.sslip.io"
+
+usage() {
+  echo "használat: $0 [--only] <hosztnév> [további hoszt...]" >&2
+  echo "  példa: $0 ktbp.hu" >&2
+  echo "  --only : csak a megadott hoszt(ok), a sslip.io címet is leváltja" >&2
+  exit 2
+}
+
+only=0
+hosts=()
+for a in "$@"; do
+  case "$a" in
+    --only) only=1 ;;
+    -h|--help) usage ;;
+    *) hosts+=("$a") ;;
+  esac
+done
+[[ ${#hosts[@]} -ge 1 ]] || usage
+
+ok_host() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ "$1" == *.* ]]
+}
+
+for h in "${hosts[@]}"; do
+  if ! ok_host "$h"; then
+    echo "hibás hosztnév: $h" >&2
+    exit 2
+  fi
+done
+
+primary="${hosts[0]}"
+extra_list=()
+if [[ ${#hosts[@]} -gt 1 ]]; then
+  extra_list=("${hosts[@]:1}")
+fi
+if [[ "$only" -eq 0 ]]; then
+  if [[ "$primary" != "$DEFAULT_EXTRA" ]]; then
+    already=0
+    for e in "${extra_list[@]}"; do
+      [[ "$e" == "$DEFAULT_EXTRA" ]] && already=1
+    done
+    if [[ "$already" -eq 0 ]]; then
+      extra_list+=("$DEFAULT_EXTRA")
+    fi
+  fi
+fi
+
+# env frissítése a kulcs kiírása nélkül
+python3 - "$ENV_FILE" "$primary" "$(IFS=','; echo "${extra_list[*]}")" << 'PY'
+import pathlib, re, sys, os
+path, host, extra = sys.argv[1], sys.argv[2], sys.argv[3]
+p = pathlib.Path(path)
+text = p.read_text(encoding="utf-8") if p.exists() else ""
+
+def upsert(text, key, value):
+    line = f"{key}={value}"
+    if re.search(rf"^{re.escape(key)}=", text, flags=re.M):
+        return re.sub(rf"^{re.escape(key)}=.*$", line, text, count=1, flags=re.M)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + line + "\n"
+
+text = upsert(text, "KT_HOST", host)
+text = upsert(text, "KT_HOST_EXTRA", extra)
+tmp = pathlib.Path(str(p) + ".tmp")
+tmp.write_text(text, encoding="utf-8")
+os.chmod(tmp, 0o600)
+# tulajdonjog megőrzése, ha van
+try:
+    st = p.stat()
+    os.chown(tmp, st.st_uid, st.st_gid)
+except Exception:
+    pass
+tmp.replace(p)
+PY
+
+write_caddy() {
+  local primary="$1"
+  shift
+  local extras=("$@")
+  local all=("$primary")
+  local e
+  for e in "${extras[@]}"; do
+    [[ -n "$e" && "$e" != "$primary" ]] && all+=("$e")
+  done
+  {
+    echo "# KT reverse proxy. Ne szerkeszd kézzel; használd: sudo kt-set-domain <host>"
+    echo
+    local h
+    for h in "${all[@]}"; do
+      echo "${h} {"
+      echo "	encode gzip"
+      echo "	reverse_proxy 127.0.0.1:8787"
+      echo "}"
+      echo
+    done
+  } > "$CADDY_FILE"
+  chmod 0644 "$CADDY_FILE" || true
+}
+
+write_caddy "$primary" "${extra_list[@]}"
+
+if command -v caddy >/dev/null 2>&1; then
+  caddy validate --config "$CADDY_FILE" >/dev/null
+fi
+
+if command -v systemctl >/dev/null 2>&1 && [[ "${KT_DRYRUN:-0}" != 1 ]]; then
+  if systemctl is-enabled caddy >/dev/null 2>&1 || systemctl is-active caddy >/dev/null 2>&1; then
+    systemctl reload caddy
+  fi
+  # CORS /health a Python-szerveren a KT_HOST-ot olvassa: illik újraindítani
+  if systemctl is-active kt-server >/dev/null 2>&1; then
+    systemctl restart kt-server
+  fi
+fi
+
+echo "kész. elsődleges hoszt: https://${primary}"
+if [[ ${#extra_list[@]} -gt 0 ]]; then
+  echo "további: ${extra_list[*]}"
+fi

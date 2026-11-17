@@ -1,0 +1,2 @@
+# A kt-server csak a Python 3 standard könyvtárat használja.
+# A venv ettől függetlenül létrejön; ide később tehető függőség.
