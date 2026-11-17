@@ -266,7 +266,7 @@ write_env_and_token() {
   umask 077
   install -d -m 0750 "$ETC_DIR"
   # env írása pythonnal, a kulcsot nem echozzuk
-  KT_WRITE_HOST="$host" KT_WRITE_EXTRA="$extra" KT_WRITE_DATA="$DATA_DIR" \
+  BKK_API_KEY="$BKK_API_KEY" KT_WRITE_HOST="$host" KT_WRITE_EXTRA="$extra" KT_WRITE_DATA="$DATA_DIR" \
   KT_WRITE_LOG="$LOG_DIR" KT_WRITE_TOKEN_FILE="$TOKEN_FILE" \
   python3 - "$ENV_FILE" << 'PY'
 import os, pathlib, tempfile, sys
