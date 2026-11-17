@@ -191,11 +191,12 @@ setup_venv() {
     if [[ "$DRY" -eq 1 ]]; then
       python3 -m venv "$VENV_DIR"
     else
-      install -d -m 0750 "$VENV_DIR"
-      chown "$APP_USER:$APP_USER" "$DATA_DIR"
-      sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
+      rm -rf "$VENV_DIR"
+      python3 -m venv "$VENV_DIR"
+      chown -R "$APP_USER:$APP_USER" "$DATA_DIR"
     fi
   fi
+  [[ "$DRY" -eq 1 ]] || chown -R "$APP_USER:$APP_USER" "$VENV_DIR"
   if [[ -f "$REPO_DIR/server/requirements.txt" ]] && grep -qE '^[^#[:space:]]' "$REPO_DIR/server/requirements.txt"; then
     if [[ "$DRY" -eq 1 ]]; then
       "$VENV_DIR/bin/pip" install -q -r "$REPO_DIR/server/requirements.txt" || true
