@@ -78,7 +78,19 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline"]
+
+# v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
+LASTKNOWN_R_DEFAULT = 1500
+LASTKNOWN_R_MAX = 5000
+OFFLINE_DEPOT_R = 800
+DEPOTS = [
+    ("Hunyadi", 47.4306299, 19.0423898),
+    ("Mogyoródi", 47.5069959, 19.112158),
+    ("Etele", 47.464017, 19.0224192),
+    ("Pevdi", 47.5969396, 18.9527357),
+    ("Szigethalom", 47.3317937, 19.0025362),
+]
 
 SECRET_PARAM_RE = re.compile(r"(?i)(key|token|apikey|api_key)=[^&\s]*")
 SAFE_EP_RE = re.compile(r"^[a-z0-9_\-]+\.(json|pb)$")
@@ -501,6 +513,38 @@ class State:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_plate_ts ON fleet_history(plate, ts)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plate_last (
+              plate TEXT PRIMARY KEY,
+              ts INTEGER NOT NULL,
+              lat REAL,
+              lon REAL,
+              route TEXT,
+              trip TEXT,
+              vehicle_id TEXT,
+              first_seen INTEGER
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_lat_lon ON plate_last(lat, lon)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_ts ON plate_last(ts)")
+        # indulási feltöltés a meglévő fleet_history-ból (rendszámonként a legutolsó sor; az első látás = legkorábbi sor)
+        conn.execute(
+            """
+            INSERT INTO plate_last(plate, ts, lat, lon, route, trip, vehicle_id, first_seen)
+            SELECT h.plate, h.ts, h.lat, h.lon, h.route, h.trip, h.vehicle_id, m.mn
+            FROM fleet_history h
+            JOIN (SELECT plate, MAX(ts) AS mx, MIN(ts) AS mn FROM fleet_history GROUP BY plate) m
+              ON h.plate = m.plate AND h.ts = m.mx
+            WHERE 1
+            ON CONFLICT(plate) DO UPDATE SET
+              ts = excluded.ts, lat = excluded.lat, lon = excluded.lon, route = excluded.route,
+              trip = excluded.trip, vehicle_id = excluded.vehicle_id,
+              first_seen = MIN(COALESCE(plate_last.first_seen, excluded.first_seen), excluded.first_seen)
+            WHERE excluded.ts > plate_last.ts
+            """
+        )
         conn.commit()
         return conn
 
@@ -987,6 +1031,13 @@ def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
         return
     try:
         with STATE.db_lock:
+            # v1.22: plate_last – minden gyűjtéskor frissül (a kiszűrt, változatlan pontoknál is: „utoljára látva” = most)
+            STATE.db.executemany(
+                "INSERT INTO plate_last(plate,ts,lat,lon,route,trip,vehicle_id,first_seen) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(plate) DO UPDATE SET ts=excluded.ts, lat=excluded.lat, lon=excluded.lon, route=excluded.route, "
+                "trip=excluded.trip, vehicle_id=excluded.vehicle_id WHERE excluded.ts >= plate_last.ts",
+                [(r[0], r[1], r[2], r[3], r[4], r[5], r[7], r[1]) for r in rows],
+            )
             # skip if last point for plate is essentially identical
             last = {
                 r[0]: r
@@ -1048,6 +1099,100 @@ def prune_history() -> None:
                 log("history_prune deleted=%s" % cur.rowcount)
     except Exception as e:
         log("history_prune_error err=%s" % type(e).__name__)
+
+
+def nearest_depot(lat: Optional[float], lon: Optional[float], rmax: float = OFFLINE_DEPOT_R) -> tuple[Optional[str], Optional[int]]:
+    if lat is None or lon is None:
+        return None, None
+    best, bd = None, None
+    for n, dlat, dlon in DEPOTS:
+        d = haversine_m(lat, lon, dlat, dlon)
+        if d <= rmax and (bd is None or d < bd):
+            best, bd = n, d
+    return best, (int(round(bd)) if bd is not None else None)
+
+
+def live_plates() -> set[str]:
+    assert STATE is not None
+    snap = STATE.fleet.snapshot()
+    out: set[str] = set()
+    for v in snap["list"] or []:
+        p = norm_plate(v.get("licensePlate"))
+        if p:
+            out.add(p)
+    return out
+
+
+def _pl_row(r: Any, t_now: int, lat0: Optional[float] = None, lon0: Optional[float] = None) -> dict[str, Any]:
+    dep, dd = nearest_depot(r[2], r[3])
+    o = {
+        "plate": r[0],
+        "ts": r[1],
+        "lat": r[2],
+        "lon": r[3],
+        "route": r[4] or "",
+        "trip": r[5] or "",
+        "vehicleId": r[6] or "",
+        "firstSeen": r[7],
+        "ageSec": max(0, int((t_now - r[1]) / 1000)),
+        "depot": dep,
+        "depotDist": dd,
+    }
+    if lat0 is not None and lon0 is not None and r[2] is not None and r[3] is not None:
+        o["dist"] = int(round(haversine_m(lat0, lon0, r[2], r[3])))
+    return o
+
+
+def lastknown_query(lat: float, lon: float, r: float, maxage: Optional[int] = None, limit: int = 300) -> list[dict[str, Any]]:
+    """Rendszámonként a legutolsó hely (plate_last) a körön belül; az élő flottában lévő rendszámok nélkül.
+    Bounding-box előszűrés indexen (lat, lon), utána pontos távolság."""
+    assert STATE is not None
+    r = max(10.0, min(float(r), float(LASTKNOWN_R_MAX)))
+    dlat = r / 111320.0
+    dlon = r / (111320.0 * max(0.2, math.cos(math.radians(lat))))
+    t_now = now_ms()
+    args: list[Any] = [lat - dlat, lat + dlat, lon - dlon, lon + dlon]
+    cond = ""
+    if maxage:
+        cond = " AND ts >= ?"
+        args.append(t_now - int(maxage) * 1000)
+    with STATE.db_lock:
+        rows = STATE.db.execute(
+            "SELECT plate, ts, lat, lon, route, trip, vehicle_id, first_seen FROM plate_last "
+            "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?" + cond,
+            args,
+        ).fetchall()
+    live = live_plates()
+    out = [_pl_row(x, t_now, lat, lon) for x in rows if x[0] not in live]
+    out = [o for o in out if o.get("dist", 1e9) <= r]
+    out.sort(key=lambda o: o["dist"])
+    return out[: max(1, min(int(limit), 2000))]
+
+
+def lastknown_plate(plate: str) -> Optional[dict[str, Any]]:
+    assert STATE is not None
+    p = norm_plate(plate)
+    with STATE.db_lock:
+        r = STATE.db.execute(
+            "SELECT plate, ts, lat, lon, route, trip, vehicle_id, first_seen FROM plate_last WHERE plate=?", (p,)
+        ).fetchone()
+    if not r:
+        return None
+    o = _pl_row(r, now_ms())
+    o["live"] = p in live_plates()
+    return o
+
+
+def offline_query(minage: int = 3600) -> list[dict[str, Any]]:
+    assert STATE is not None
+    t_now = now_ms()
+    with STATE.db_lock:
+        rows = STATE.db.execute(
+            "SELECT plate, ts, lat, lon, route, trip, vehicle_id, first_seen FROM plate_last WHERE ts <= ? ORDER BY ts ASC",
+            (t_now - max(0, int(minage)) * 1000,),
+        ).fetchall()
+    live = live_plates()
+    return [_pl_row(x, t_now) for x in rows if x[0] not in live]
 
 
 def history_query(plate: str, t_from: Optional[int], t_to: Optional[int], limit: int = 5000) -> list[dict[str, Any]]:
@@ -1334,6 +1479,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_fleet()
             if path == "/history":
                 return self._send_history(params)
+            if path == "/lastknown":
+                return self._send_lastknown(params)
+            if path == "/offline":
+                return self._send_offline(params)
 
             futar_ep = match_futar(path)
             if futar_ep:
@@ -1547,6 +1696,41 @@ class Handler(BaseHTTPRequestHandler):
                 return None
         rows = history_query(plate, maybe_int("from"), maybe_int("to"), maybe_int("limit") or 5000)
         self._send_json(200, {"status": "OK", "plate": norm_plate(plate), "n": len(rows), "points": rows})
+
+    def _send_lastknown(self, params: dict[str, list[str]]) -> None:
+        def num(name: str) -> Optional[float]:
+            s = first(params, name)
+            if s is None or s == "":
+                return None
+            try:
+                v = float(s)
+            except ValueError:
+                return None
+            return v if math.isfinite(v) else None
+        plate = first(params, "plate") or ""
+        if plate:
+            o = lastknown_plate(plate)
+            return self._send_json(200, {"status": "OK", "now": now_ms(), "plate": norm_plate(plate), "found": bool(o), "point": o})
+        lat, lon = num("lat"), num("lon")
+        if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return self._send_json(400, {"status": "ERROR", "text": "lat, lon required"})
+        r = num("r")
+        r = LASTKNOWN_R_DEFAULT if r is None or r <= 0 else min(r, LASTKNOWN_R_MAX)
+        ma = num("maxage")
+        rows = lastknown_query(lat, lon, r, int(ma) if ma and ma > 0 else None)
+        self._send_json(200, {"status": "OK", "now": now_ms(), "r": int(r), "n": len(rows), "list": rows})
+
+    def _send_offline(self, params: dict[str, list[str]]) -> None:
+        s = first(params, "minage")
+        try:
+            minage = int(float(s)) if s not in (None, "") else 3600
+        except ValueError:
+            minage = 3600
+        minage = max(0, minage)
+        with STATE.db_lock:
+            since = STATE.db.execute("SELECT MIN(first_seen) FROM plate_last").fetchone()[0]
+        rows = offline_query(minage)
+        self._send_json(200, {"status": "OK", "now": now_ms(), "minage": minage, "since": since, "n": len(rows), "list": rows})
 
     def _proxy_futar(self, endpoint: str, params: dict[str, list[str]]) -> None:
         if endpoint == "vehicles-for-location.json":

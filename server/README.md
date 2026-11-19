@@ -62,6 +62,8 @@ Minden végpont – a `/health` kivételével – kliens tokent kér (`X-KT-Toke
 | `GET /api/gtfs-rt/<név>.pb` | GTFS-RT proxy (60 mp-es tár) |
 | `GET /fleet` | a teljes Volán-flotta egy kérésben |
 | `GET /history?plate=…&from=…&to=…` | szerveroldali útvonal-előzmény (ms időbélyegek, 7 nap) |
+| `GET /lastknown?lat=…&lon=…&r=…&maxage=…` | v1.22: rendszámonként az utolsó ismert hely a körben (alap r 1500 m, max 5000 m; `maxage` mp, elhagyható), az élő flottában lévők nélkül; `?plate=…` egy rendszámra |
+| `GET /offline?minage=…` | v1.22: minden nem élő rendszám utolsó helye (alap `minage` 3600 mp), legrégebbi elöl, legközelebbi telephely 800 m-en belül; `since` = első adat |
 | `GET /sync/<id>[?rev=N]` | **új (v1.04)** – eszközszinkron-dokumentum; ha `rev` nem változott: `{"unchanged":true}` |
 | `PUT /sync/<id>` (POST is) | **új (v1.04)** – `{"data":{"kulcs":{"v":"érték"\|null,"ts":ms}}}`; kulcsonként last-write-wins |
 
@@ -72,3 +74,9 @@ Eszközszinkron: külön SQLite (`$KT_DATA_DIR/sync.sqlite`). Korlátok (env-bő
 429). Az azonosító 16–64 karakter `[A-Za-z0-9_-]`; a naplóba `/sync/[id]`
 kerül, a token és az azonosító nem. A jövőbeli időbélyeget a szerver levágja.
 A sync- és auth-végpontok BKK-hívást nem indítanak.
+
+## v1.22: `plate_last`
+
+Rendszámonként az utolsó ismert hely (`plate, ts, lat, lon, route, trip, vehicle_id, first_seen`). Minden gyűjtéskor frissül, **soha nem törlődik**
+(a teljes nyomvonal, `fleet_history`, marad `KT_HISTORY_DAYS` = 7 nap). Induláskor a meglévő `fleet_history`-ból feltöltődik.
+Az adat csak a gyűjtés kezdetétől létezik (élő szerver: kb. 2026-11-17 este).
