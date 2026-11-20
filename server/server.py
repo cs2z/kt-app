@@ -84,6 +84,7 @@ SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "last
 LASTKNOWN_R_DEFAULT = 1500
 LASTKNOWN_R_MAX = 5000
 OFFLINE_DEPOT_R = 800
+OFFLINE_MINAGE_DEFAULT = 3600
 DEPOTS = [
     ("Hunyadi", 47.4306299, 19.0423898),
     ("Mogyoródi", 47.5069959, 19.112158),
@@ -527,6 +528,9 @@ class State:
             )
             """
         )
+        # v1.37: plate_last.sig – 1: a ts a busz saját utolsó jele (FUTÁR lastUpdateTime), 0: régi sor (a ts a gyűjtés ideje volt)
+        if "sig" not in [r[1] for r in conn.execute("PRAGMA table_info(plate_last)").fetchall()]:
+            conn.execute("ALTER TABLE plate_last ADD COLUMN sig INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_lat_lon ON plate_last(lat, lon)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_ts ON plate_last(ts)")
         # indulási feltöltés a meglévő fleet_history-ból (rendszámonként a legutolsó sor; az első látás = legkorábbi sor)
@@ -1005,6 +1009,7 @@ def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
     assert STATE is not None
     ts = now_ms()
     rows = []
+    sigs: dict[str, tuple[int, int]] = {}  # v1.37: rendszám → (a busz saját jelének ideje ms, sig)
     for v in lst:
         plate = norm_plate(v.get("licensePlate"))
         if not plate:
@@ -1015,6 +1020,7 @@ def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
             lon = float(loc.get("lon"))
         except (TypeError, ValueError):
             continue
+        sigs[plate] = signal_ms(v, ts)
         rows.append(
             (
                 plate,
@@ -1031,12 +1037,15 @@ def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
         return
     try:
         with STATE.db_lock:
-            # v1.22: plate_last – minden gyűjtéskor frissül (a kiszűrt, változatlan pontoknál is: „utoljára látva” = most)
+            # v1.37: plate_last.ts = a busz SAJÁT utolsó jele (FUTÁR lastUpdateTime; ha nincs: a gyűjtés ideje), nem a gyűjtés ideje.
+            # Így a FUTÁR-ban még szereplő, de régóta jel nélküli busz is „régóta nem látott” lesz; friss jelnél (menet vagy ASP) azonnal frissül.
+            # A régi (sig=0, gyűjtési idős) sor az első gyűjtéskor felülíródik akkor is, ha a valódi jel régebbi.
             STATE.db.executemany(
-                "INSERT INTO plate_last(plate,ts,lat,lon,route,trip,vehicle_id,first_seen) VALUES (?,?,?,?,?,?,?,?) "
+                "INSERT INTO plate_last(plate,ts,lat,lon,route,trip,vehicle_id,first_seen,sig) VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(plate) DO UPDATE SET ts=excluded.ts, lat=excluded.lat, lon=excluded.lon, route=excluded.route, "
-                "trip=excluded.trip, vehicle_id=excluded.vehicle_id WHERE excluded.ts >= plate_last.ts",
-                [(r[0], r[1], r[2], r[3], r[4], r[5], r[7], r[1]) for r in rows],
+                "trip=excluded.trip, vehicle_id=excluded.vehicle_id, sig=excluded.sig "
+                "WHERE excluded.ts >= plate_last.ts OR plate_last.sig = 0",
+                [(r[0], sigs[r[0]][0], r[2], r[3], r[4], r[5], r[7], sigs[r[0]][0], sigs[r[0]][1]) for r in rows],
             )
             # skip if last point for plate is essentially identical
             last = {
@@ -1099,6 +1108,35 @@ def prune_history() -> None:
                 log("history_prune deleted=%s" % cur.rowcount)
     except Exception as e:
         log("history_prune_error err=%s" % type(e).__name__)
+
+
+def signal_ms(v: dict[str, Any], poll_ms: int) -> tuple[int, int]:
+    """v1.37: a busz saját utolsó jelének ideje (ms) a FUTÁR lastUpdateTime-ból (mp vagy ms), legfeljebb a gyűjtés ideje.
+    Ha hiányzik / hibás: a gyűjtés ideje. Visszatér: (ts_ms, sig) – sig=1, ha a busz saját jeléből jön."""
+    try:
+        lu = float(v.get("lastUpdateTime") or 0)
+    except (TypeError, ValueError):
+        lu = 0
+    if lu <= 0:
+        return poll_ms, 0
+    ms = int(lu if lu > 1e11 else lu * 1000)
+    return min(ms, poll_ms), 1
+
+
+def live_fresh_plates(max_age_s: int = OFFLINE_MINAGE_DEFAULT) -> set[str]:
+    """v1.37: a FUTÁR-ban most szereplő rendszámok, amelyek saját jele max_age_s-nél frissebb (menetben vagy ASP)."""
+    assert STATE is not None
+    snap = STATE.fleet.snapshot()
+    t = now_ms()
+    out: set[str] = set()
+    for v in snap["list"] or []:
+        p = norm_plate(v.get("licensePlate"))
+        if not p:
+            continue
+        ts, _sig = signal_ms(v, t)
+        if t - ts < max_age_s * 1000:
+            out.add(p)
+    return out
 
 
 def nearest_depot(lat: Optional[float], lon: Optional[float], rmax: float = OFFLINE_DEPOT_R) -> tuple[Optional[str], Optional[int]]:
@@ -1183,7 +1221,7 @@ def lastknown_plate(plate: str) -> Optional[dict[str, Any]]:
     return o
 
 
-def offline_query(minage: int = 3600) -> list[dict[str, Any]]:
+def offline_query(minage: int = OFFLINE_MINAGE_DEFAULT) -> list[dict[str, Any]]:
     assert STATE is not None
     t_now = now_ms()
     with STATE.db_lock:
@@ -1191,7 +1229,8 @@ def offline_query(minage: int = 3600) -> list[dict[str, Any]]:
             "SELECT plate, ts, lat, lon, route, trip, vehicle_id, first_seen FROM plate_last WHERE ts <= ? ORDER BY ts ASC",
             (t_now - max(0, int(minage)) * 1000,),
         ).fetchall()
-    live = live_plates()
+    # v1.37: csak a FUTÁR-ban friss (minage-nél újabb) saját jellel szereplő busz marad ki; a listában lévő, de régóta jel nélküli nem
+    live = live_fresh_plates(max(1, int(minage)))
     return [_pl_row(x, t_now) for x in rows if x[0] not in live]
 
 
