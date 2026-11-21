@@ -78,7 +78,7 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform"]
 
 # v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
 LASTKNOWN_R_DEFAULT = 1500
@@ -1416,6 +1416,585 @@ def stats_logger() -> None:
             log("stats_write_error err=%s" % type(e).__name__)
 
 
+# ---------------------------------------------------------------------------
+# srv-volan1: országos Volánbusz statikus GTFS (KTI, nyilvános) + MÁVINFORM RSS
+# Kulcs nélküli, nyilvános források; a BKK-kulcshoz nem nyúl. Csak stdlib.
+# ---------------------------------------------------------------------------
+VOLAN_DIR = DATA_DIR / "volan"
+VOLAN_GTFS_URL = (os.environ.get("KT_VOLAN_GTFS_URL") or "https://gtfs.kti.hu/public-gtfs/volanbusz_gtfs.zip").strip()
+MAVINFORM_URL = (os.environ.get("KT_MAVINFORM_URL") or "https://www.mavcsoport.hu/mavinform/rss.xml").strip()
+VOLAN_GTFS_ZIP = VOLAN_DIR / "volanbusz_gtfs.zip"
+VOLAN_GTFS_META = VOLAN_DIR / "gtfs_meta.json"
+VOLAN_GTFS_DB = VOLAN_DIR / "gtfs_index.sqlite"
+VOLAN_ROUTES_GZ = VOLAN_DIR / "routes.json.gz"
+VOLAN_STOPS_GZ = VOLAN_DIR / "stops.json.gz"
+MAVINFORM_STORE = VOLAN_DIR / "mavinform.json"
+VOLAN_GTFS_AT = os.environ.get("KT_VOLAN_GTFS_AT", "03:30")         # Budapest idő, napi letöltés
+VOLAN_GTFS_MAX_AGE = 24 * 3600                                       # induláskor: ha nincs / ennél régebbi
+VOLAN_GTFS_MAX_BYTES = int(os.environ.get("KT_VOLAN_GTFS_MAX_BYTES", str(400 * 1024 * 1024)))
+VOLAN_MIN_FREE_BYTES = int(os.environ.get("KT_VOLAN_MIN_FREE", str(350 * 1024 * 1024)))
+MAVINFORM_EVERY = int(os.environ.get("KT_MAVINFORM_EVERY", "300"))
+MAVINFORM_MAX_ITEMS = 500
+MAVINFORM_MAX_DAYS = 30
+MAVINFORM_MAX_BYTES = 2 * 1024 * 1024
+VOLAN_UA = "kt-server/0.2 (KT app, VOLAN Agglo tartalek-szolgalat; +https://cs2z.github.io/kt-app/)"
+MAVINFORM_CATS: list[tuple[str, str]] = [   # ékezet- és kisbetű-független regexek (fold() után)
+    ("potlas", r"potlobusz|vonatpotl|\bpotlo\b|\bpotlas|\bpotol(?:ja|jak|juk)\b"),
+    ("vaganyzar", r"vaganyzar"),
+    ("kimarad", r"kimarad|elmarad|nem kozlekedik|nem kozlekednek|\btorol|\btorli"),
+    ("volan", r"volan"),
+    ("autobusz", r"busz"),
+    ("keses", r"\bkeses|\bkesik\b|\bkesnek\b|\bkesve\b|\bkeso\b"),
+    ("korlatozas", r"forgalomkorlatoz|korlatoz|akadaly|elakad|tereles|lezar|baleset|muszaki hiba|fennakad|zavar|szunetel|egy vaganyon"),
+    ("sztrajk", r"sztrajk|munkabeszuntet"),
+    ("hev", r"\bhev\b|\bh[5-9]\b"),
+    ("helyreallt", r"helyreall|\bvege a\b|vege a tereles|ujra kozlekedik|ujra kozlekednek|megszunt"),
+]
+_MAVINFORM_RE = [(c, re.compile(rx)) for c, rx in MAVINFORM_CATS]
+_VOLAN_LOCK = threading.Lock()   # GTFS-csere / RSS-tár írás
+
+
+def fold(s: Optional[str]) -> str:
+    """Kis- és ékezet-független alak (keresés, kulcsszó)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def bud_now() -> time.struct_time:
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        return _dt.datetime.now(ZoneInfo("Europe/Budapest")).timetuple()
+    except Exception:
+        return time.localtime()
+
+
+def _json_write_atomic(path: Path, obj: Any) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def _json_read(path: Path, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def volan_net_enabled(what: str = "any") -> bool:
+    """what: gtfs / rss / any. KTMOCK: nincs kimenő hívás, csak ha a teszt helyi forrást (KT_VOLAN_GTFS_URL / KT_MAVINFORM_URL) ad."""
+    if (os.environ.get("KT_VOLAN_DISABLE") or "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if not is_mock():
+        return True
+    g = bool(os.environ.get("KT_VOLAN_GTFS_URL"))
+    r = bool(os.environ.get("KT_MAVINFORM_URL"))
+    return g if what == "gtfs" else r if what == "rss" else (g or r)
+
+
+def gtfs_meta() -> dict[str, Any]:
+    return _json_read(VOLAN_GTFS_META, {})
+
+
+def _gtfs_build_index(zpath: Path, db_tmp: Path) -> dict[str, Any]:
+    """Könnyű, folyamos feldolgozás: routes/stops/agency/feed_info + számlálók. stop_times / shapes nem kerül memóriába."""
+    import csv
+    import gzip
+    import io
+    import zipfile
+    info: dict[str, Any] = {}
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+        for req in ("agency.txt", "routes.txt", "stops.txt", "trips.txt"):
+            if req not in names:
+                raise RuntimeError("gtfs_missing_%s" % req)
+
+        def rows(name: str):
+            with zf.open(name) as raw:
+                yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
+
+        agencies = {r.get("agency_id") or "": (r.get("agency_name") or "").strip() for r in rows("agency.txt")}
+        fi: dict[str, str] = {}
+        if "feed_info.txt" in names:
+            for r in rows("feed_info.txt"):
+                fi = {k: (v or "") for k, v in r.items() if k}
+                break
+        trips_by_route: dict[str, int] = defaultdict(int)
+        n_trips = 0
+        for r in rows("trips.txt"):
+            trips_by_route[r.get("route_id") or ""] += 1
+            n_trips += 1
+        n_st = None
+        if "stop_times.txt" in names:
+            n_st = -1  # fejléc
+            with zf.open("stop_times.txt") as raw:
+                while True:
+                    b = raw.read(1 << 20)
+                    if not b:
+                        break
+                    n_st += b.count(b"\n")
+        if db_tmp.exists():
+            db_tmp.unlink()
+        conn = sqlite3.connect(db_tmp)
+        try:
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("CREATE TABLE agency(id TEXT PRIMARY KEY, name TEXT)")
+            conn.execute("CREATE TABLE routes(id TEXT PRIMARY KEY, short TEXT, long TEXT, type INTEGER, agency TEXT, network TEXT, color TEXT, ntrips INTEGER, fold TEXT)")
+            conn.execute("CREATE TABLE stops(id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL, loc INTEGER, parent TEXT, platform TEXT, fold TEXT)")
+            conn.executemany("INSERT INTO agency VALUES(?,?)", list(agencies.items()))
+            rgz = gzip.open(str(VOLAN_ROUTES_GZ) + ".tmp", "wt", encoding="utf-8")
+            rgz.write('{"fields":["id","short","long","type","agency","network","ntrips"],"rows":[')
+            batch: list[tuple] = []
+            n_routes = 0
+            for r in rows("routes.txt"):
+                rid = r.get("route_id") or ""
+                if not rid:
+                    continue
+                try:
+                    rt = int(r.get("route_type") or 3)
+                except ValueError:
+                    rt = 3
+                short = (r.get("route_short_name") or "").strip()
+                long_ = (r.get("route_long_name") or "").strip()
+                ag = r.get("agency_id") or ""
+                net = (r.get("route_network") or "").strip()
+                nt = trips_by_route.get(rid, 0)
+                batch.append((rid, short, long_, rt, ag, net, (r.get("route_color") or ""), nt, fold(short + " " + long_)))
+                rgz.write(("," if n_routes else "") + json.dumps([rid, short, long_, rt, ag, net, nt], ensure_ascii=False, separators=(",", ":")))
+                n_routes += 1
+            conn.executemany("INSERT OR REPLACE INTO routes VALUES(?,?,?,?,?,?,?,?,?)", batch)
+            rgz.write('],"agency":' + json.dumps(agencies, ensure_ascii=False, separators=(",", ":")) + "}")
+            rgz.close()
+            del batch
+            sgz = gzip.open(str(VOLAN_STOPS_GZ) + ".tmp", "wt", encoding="utf-8")
+            sgz.write('{"fields":["id","name","lat","lon","loc","parent"],"rows":[')
+            n_stops = 0
+            sb: list[tuple] = []
+            for r in rows("stops.txt"):
+                sid = r.get("stop_id") or ""
+                if not sid:
+                    continue
+                try:
+                    lat = round(float(r.get("stop_lat") or "nan"), 6)
+                    lon = round(float(r.get("stop_lon") or "nan"), 6)
+                except ValueError:
+                    continue
+                if not (math.isfinite(lat) and math.isfinite(lon)):
+                    continue
+                try:
+                    loc = int(r.get("location_type") or 0)
+                except ValueError:
+                    loc = 0
+                name = (r.get("stop_name") or "").strip()
+                par = r.get("parent_station") or ""
+                sb.append((sid, name, lat, lon, loc, par, r.get("platform_code") or "", fold(name)))
+                sgz.write(("," if n_stops else "") + json.dumps([sid, name, lat, lon, loc, par], ensure_ascii=False, separators=(",", ":")))
+                n_stops += 1
+                if len(sb) >= 5000:
+                    conn.executemany("INSERT OR REPLACE INTO stops VALUES(?,?,?,?,?,?,?,?)", sb)
+                    sb = []
+            if sb:
+                conn.executemany("INSERT OR REPLACE INTO stops VALUES(?,?,?,?,?,?,?,?)", sb)
+            sgz.write("]}")
+            sgz.close()
+            conn.execute("CREATE INDEX idx_stops_lat ON stops(lat, lon)")
+            conn.commit()
+        finally:
+            conn.close()
+    info.update(
+        {
+            "feed_info": fi,
+            "valid_from": fi.get("feed_start_date") or None,
+            "valid_to": fi.get("feed_end_date") or None,
+            "feed_version": fi.get("feed_version") or None,
+            "counts": {"agency": len(agencies), "routes": n_routes, "stops": n_stops, "trips": n_trips, "stop_times": n_st},
+            "agencies": [{"id": k, "name": v} for k, v in sorted(agencies.items())],
+            "files": sorted(names),
+        }
+    )
+    return info
+
+
+def gtfs_update(force: bool = False) -> bool:
+    """Napi letöltés: feltételes kérés (ETag/Last-Modified, ha van), lemezre folyamosan, ellenőrzés után atomi csere."""
+    import hashlib
+    import shutil
+    VOLAN_DIR.mkdir(parents=True, exist_ok=True)
+    old = gtfs_meta()
+    try:
+        free = shutil.disk_usage(VOLAN_DIR).free
+        if free < VOLAN_MIN_FREE_BYTES:
+            log("volan_gtfs_skip low_disk free_mb=%s" % (free // (1 << 20)))
+            _gtfs_note(old, "low_disk")
+            return False
+    except Exception:
+        pass
+    part = VOLAN_DIR / "volanbusz_gtfs.zip.part"
+    t0 = now()
+    hdr = {"User-Agent": VOLAN_UA, "Accept": "application/zip"}
+    if not force and VOLAN_GTFS_ZIP.exists():
+        if old.get("etag"):
+            hdr["If-None-Match"] = old["etag"]
+        if old.get("last_modified"):
+            hdr["If-Modified-Since"] = old["last_modified"]
+    try:
+        req = urllib.request.Request(VOLAN_GTFS_URL, headers=hdr)
+        h = hashlib.sha256()
+        size = 0
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            if e.code == 304 and (e.geturl() or VOLAN_GTFS_URL) == VOLAN_GTFS_URL:   # átirányítás utáni 304-et nem fogadunk el
+                old["checked_at"] = now_ms()
+                old["last_result"] = "not_modified"
+                _json_write_atomic(VOLAN_GTFS_META, old)
+                log("volan_gtfs not_modified")
+                return True
+            raise
+        with resp, open(part, "wb") as f:
+            etag = resp.headers.get("ETag") or ""
+            lastmod = resp.headers.get("Last-Modified") or ""
+            while True:
+                b = resp.read(1 << 20)
+                if not b:
+                    break
+                size += len(b)
+                if size > VOLAN_GTFS_MAX_BYTES:
+                    raise RuntimeError("gtfs_too_large")
+                h.update(b)
+                f.write(b)
+        sha = h.hexdigest()
+        dl_sec = round(now() - t0, 1)
+        if sha == old.get("sha256") and VOLAN_GTFS_ZIP.exists() and VOLAN_GTFS_DB.exists():
+            part.unlink()
+            old.update({"checked_at": now_ms(), "last_result": "unchanged", "etag": etag, "last_modified": lastmod})
+            _json_write_atomic(VOLAN_GTFS_META, old)
+            log("volan_gtfs unchanged size=%s sec=%s" % (size, dl_sec))
+            return True
+        db_tmp = VOLAN_DIR / "gtfs_index.sqlite.tmp"
+        info = _gtfs_build_index(part, db_tmp)   # hibás zip esetén itt elszáll → a régi marad
+        with _VOLAN_LOCK:
+            os.replace(part, VOLAN_GTFS_ZIP)
+            os.replace(db_tmp, VOLAN_GTFS_DB)
+            os.replace(str(VOLAN_ROUTES_GZ) + ".tmp", VOLAN_ROUTES_GZ)
+            os.replace(str(VOLAN_STOPS_GZ) + ".tmp", VOLAN_STOPS_GZ)
+            meta = {
+                "source": VOLAN_GTFS_URL if VOLAN_GTFS_URL.startswith("http") else "local",
+                "downloaded_at": now_ms(),
+                "checked_at": now_ms(),
+                "last_result": "updated",
+                "last_error": None,
+                "size": size,
+                "sha256": sha,
+                "etag": etag,
+                "last_modified": lastmod,
+                "download_sec": dl_sec,
+                "index_sec": round(now() - t0 - dl_sec, 1),
+            }
+            meta.update(info)
+            _json_write_atomic(VOLAN_GTFS_META, meta)
+        c = info["counts"]
+        log("volan_gtfs updated size=%s routes=%s stops=%s trips=%s valid=%s..%s sec=%s"
+            % (size, c["routes"], c["stops"], c["trips"], info.get("valid_from"), info.get("valid_to"), round(now() - t0, 1)))
+        return True
+    except Exception as e:
+        log("volan_gtfs_error err=%s %s" % (type(e).__name__, redact(str(e))[:120]))
+        _gtfs_note(old, type(e).__name__)
+        return False
+    finally:
+        for p in (part, VOLAN_DIR / "gtfs_index.sqlite.tmp", Path(str(VOLAN_ROUTES_GZ) + ".tmp"), Path(str(VOLAN_STOPS_GZ) + ".tmp")):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+def _gtfs_note(meta: dict[str, Any], err: str) -> None:
+    try:
+        meta = dict(meta)
+        meta["checked_at"] = now_ms()
+        meta["last_result"] = "error"
+        meta["last_error"] = err
+        _json_write_atomic(VOLAN_GTFS_META, meta)
+    except Exception:
+        pass
+
+
+def _rss_text(el: Any, tag: str) -> str:
+    x = el.find(tag)
+    return (x.text or "").strip() if x is not None and x.text else ""
+
+
+def mavinform_cats(text: str) -> list[str]:
+    t = " " + re.sub(r"[^a-z0-9]+", " ", fold(text)) + " "
+    return [c for c, rx in _MAVINFORM_RE if rx.search(t)]
+
+
+def mavinform_parse(raw: bytes) -> list[dict[str, Any]]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    if b"<!ENTITY" in raw[:4096].upper():
+        raise RuntimeError("rss_entity_refused")
+    root = ET.fromstring(raw)
+    items = []
+    for it in root.iter("item"):
+        title = _rss_text(it, "title")
+        link = _rss_text(it, "link")
+        guid = _rss_text(it, "guid") or link
+        desc_raw = _rss_text(it, "description")
+        desc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc_raw)).strip()[:2000]
+        pub = _rss_text(it, "pubDate")
+        ts = None
+        try:
+            ts = int(parsedate_to_datetime(pub).timestamp() * 1000) if pub else None
+        except Exception:
+            ts = None
+        if not (guid or title):
+            continue
+        items.append({"id": guid or link or title, "title": title, "link": link, "pubDate": pub, "ts": ts,
+                      "description": desc, "cats": mavinform_cats(title + " " + desc)})
+    return items
+
+
+def mavinform_poll() -> bool:
+    VOLAN_DIR.mkdir(parents=True, exist_ok=True)
+    store = _json_read(MAVINFORM_STORE, {})
+    hdr = {"User-Agent": VOLAN_UA, "Accept": "application/rss+xml, application/xml;q=0.9"}
+    if store.get("etag"):
+        hdr["If-None-Match"] = store["etag"]
+    if store.get("last_modified"):
+        hdr["If-Modified-Since"] = store["last_modified"]
+    try:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(MAVINFORM_URL, headers=hdr), timeout=30) as resp:
+                raw = resp.read(MAVINFORM_MAX_BYTES + 1)
+                etag = resp.headers.get("ETag") or ""
+                lastmod = resp.headers.get("Last-Modified") or ""
+        except urllib.error.HTTPError as e:
+            if e.code == 304 and (e.geturl() or MAVINFORM_URL) == MAVINFORM_URL:
+                store["checked_at"] = now_ms()
+                store["last_error"] = None
+                with _VOLAN_LOCK:
+                    _json_write_atomic(MAVINFORM_STORE, store)
+                return True
+            raise
+        if len(raw) > MAVINFORM_MAX_BYTES:
+            raise RuntimeError("rss_too_large")
+        fresh = mavinform_parse(raw)
+        with _VOLAN_LOCK:
+            store = _json_read(MAVINFORM_STORE, {})
+            items = {x["id"]: x for x in (store.get("items") or []) if isinstance(x, dict) and x.get("id")}
+            t_now = now_ms()
+            added = 0
+            for x in fresh:
+                if x["id"] in items:
+                    prev = items[x["id"]]
+                    if prev.get("title") != x["title"] or prev.get("description") != x["description"]:
+                        x["first_seen"] = prev.get("first_seen") or t_now
+                        x["updated_seen"] = t_now
+                        items[x["id"]] = x
+                    continue
+                x["first_seen"] = t_now
+                items[x["id"]] = x
+                added += 1
+            cutoff = t_now - MAVINFORM_MAX_DAYS * 86400 * 1000
+            lst = [x for x in items.values() if (x.get("ts") or x.get("first_seen") or t_now) >= cutoff]
+            lst.sort(key=lambda x: x.get("ts") or x.get("first_seen") or 0, reverse=True)
+            lst = lst[:MAVINFORM_MAX_ITEMS]
+            store = {"items": lst, "checked_at": t_now, "last_ok": t_now, "last_error": None,
+                     "etag": etag, "last_modified": lastmod, "feed_items": len(fresh)}
+            _json_write_atomic(MAVINFORM_STORE, store)
+        if added:
+            log("mavinform new=%s total=%s" % (added, len(lst)))
+        return True
+    except Exception as e:
+        log("mavinform_error err=%s" % type(e).__name__)
+        try:
+            with _VOLAN_LOCK:
+                st = _json_read(MAVINFORM_STORE, {})
+                st["checked_at"] = now_ms()
+                st["last_error"] = type(e).__name__
+                _json_write_atomic(MAVINFORM_STORE, st)
+        except Exception:
+            pass
+        return False
+
+
+def volan_worker() -> None:
+    """Saját szál: MÁVINFORM 5 percenként, Volán GTFS naponta (KT_VOLAN_GTFS_AT, Budapest) + induláskor, ha hiányzik / >24 óra."""
+    assert STATE is not None
+    if not volan_net_enabled():
+        log("volan_worker off (mock or KT_VOLAN_DISABLE)")
+        return
+    if STATE.stop.wait(20):   # induláskor ne a flotta-lekéréssel versenyezzen
+        return
+    last_rss = 0.0
+    last_gtfs_day = ""
+    try:
+        hh, mm = [int(x) for x in VOLAN_GTFS_AT.split(":", 1)]
+    except Exception:
+        hh, mm = 3, 30
+    do_gtfs = volan_net_enabled("gtfs")
+    do_rss = volan_net_enabled("rss")
+    gtfs_th: Optional[threading.Thread] = None
+    m = gtfs_meta()
+    if do_gtfs and (not VOLAN_GTFS_ZIP.exists() or not VOLAN_GTFS_DB.exists()
+                    or now_ms() - int(m.get("downloaded_at") or 0) > VOLAN_GTFS_MAX_AGE * 1000):
+        gtfs_th = threading.Thread(target=gtfs_update, name="kt-volan-gtfs", daemon=True)
+        gtfs_th.start()
+    bt = bud_now()
+    if bt.tm_hour * 60 + bt.tm_min >= hh * 60 + mm:
+        # a mai időpont már elmúlt: ma nincs újabb ütemezett letöltés (induláskor a fenti 24 órás szabály dönt)
+        last_gtfs_day = time.strftime("%Y-%m-%d", bt)
+    while not STATE.stop.is_set():
+        try:
+            if do_rss and now() - last_rss >= MAVINFORM_EVERY:
+                last_rss = now()
+                mavinform_poll()
+            bt = bud_now()
+            day = time.strftime("%Y-%m-%d", bt)
+            if do_gtfs and day != last_gtfs_day and bt.tm_hour * 60 + bt.tm_min >= hh * 60 + mm:
+                last_gtfs_day = day
+                if gtfs_th is None or not gtfs_th.is_alive():
+                    gtfs_th = threading.Thread(target=gtfs_update, name="kt-volan-gtfs", daemon=True)
+                    gtfs_th.start()
+        except Exception:
+            log("volan_worker_error " + redact(traceback.format_exc().splitlines()[-1]))
+        STATE.stop.wait(15)
+
+
+def _volan_db() -> Optional[sqlite3.Connection]:
+    if not VOLAN_GTFS_DB.exists():
+        return None
+    conn = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(VOLAN_GTFS_DB)), uri=True, timeout=5)
+    return conn
+
+
+def _int_param(params: dict[str, list[str]], name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(float(first(params, name) or default))
+    except ValueError:
+        v = default
+    return max(lo, min(hi, v))
+
+
+def volan_status() -> dict[str, Any]:
+    m = gtfs_meta()
+    st = _json_read(MAVINFORM_STORE, {})
+    keep = ("source", "downloaded_at", "checked_at", "last_result", "last_error", "size", "sha256", "download_sec",
+            "index_sec", "valid_from", "valid_to", "feed_version", "feed_info", "counts", "agencies")
+    return {
+        "status": "OK",
+        "now": now_ms(),
+        "enabled": {"gtfs": volan_net_enabled("gtfs"), "mavinform": volan_net_enabled("rss")},
+        "schedule": {"gtfs_daily_at": VOLAN_GTFS_AT + " Europe/Budapest", "mavinform_every_sec": MAVINFORM_EVERY},
+        "gtfs": ({k: m.get(k) for k in keep} if m else None),
+        "gtfs_ready": VOLAN_GTFS_DB.exists(),
+        "mavinform": {"n": len(st.get("items") or []), "checked_at": st.get("checked_at"), "last_ok": st.get("last_ok"),
+                      "last_error": st.get("last_error")},
+    }
+
+
+def volan_routes(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    conn = _volan_db()
+    if conn is None:
+        return 503, {"status": "NO_DATA", "text": "volan gtfs not downloaded yet"}
+    try:
+        limit = _int_param(params, "limit", 5000, 1, 5000)
+        where, args = [], []
+        words = re.findall(r"[a-z0-9]+", fold(first(params, "q") or ""))[:6]
+        if words:
+            where.append("((" + " AND ".join(["fold LIKE ?"] * len(words)) + ") OR short = ?)")
+            args += ["%" + w + "%" for w in words] + [(first(params, "q") or "").strip()]
+        ag = (first(params, "agency") or "").strip()
+        if ag:
+            where.append("agency = ?")
+            args.append(ag)
+        net = (first(params, "network") or "").strip()
+        if net:
+            where.append("network = ?")
+            args.append(net)
+        sql = "SELECT id, short, long, type, agency, network, ntrips FROM routes" + (" WHERE " + " AND ".join(where) if where else "")
+        total = conn.execute("SELECT COUNT(*) FROM (" + sql + ")", args).fetchone()[0]
+        rows = conn.execute(sql + " ORDER BY short, id LIMIT ?", args + [limit]).fetchall()
+        agn = dict(conn.execute("SELECT id, name FROM agency").fetchall())
+    finally:
+        conn.close()
+    lst = [{"id": r[0], "short": r[1], "long": r[2], "type": r[3], "agency": r[4], "agencyName": agn.get(r[4], ""),
+            "network": r[5], "ntrips": r[6]} for r in rows]
+    m = gtfs_meta()
+    return 200, {"status": "OK", "now": now_ms(), "feed_version": m.get("feed_version"), "valid_to": m.get("valid_to"),
+                 "total": total, "n": len(lst), "list": lst}
+
+
+def volan_stops(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    conn = _volan_db()
+    if conn is None:
+        return 503, {"status": "NO_DATA", "text": "volan gtfs not downloaded yet"}
+    try:
+        limit = _int_param(params, "limit", 2000, 1, 5000)
+        where, args = [], []
+        bbox = (first(params, "bbox") or "").strip()
+        if bbox:
+            try:
+                a = [float(x) for x in bbox.split(",")]
+                if len(a) != 4 or not all(math.isfinite(x) for x in a):
+                    raise ValueError
+            except ValueError:
+                return 400, {"status": "ERROR", "text": "bbox=minLon,minLat,maxLon,maxLat"}
+            where.append("lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?")
+            args += [min(a[1], a[3]), max(a[1], a[3]), min(a[0], a[2]), max(a[0], a[2])]
+        for w in re.findall(r"[a-z0-9]+", fold(first(params, "q") or ""))[:6]:
+            where.append("fold LIKE ?")
+            args.append("%" + w + "%")
+        if (first(params, "stations") or "") in ("1", "true"):
+            where.append("loc = 1")
+        sql = "SELECT id, name, lat, lon, loc, parent, platform FROM stops" + (" WHERE " + " AND ".join(where) if where else "")
+        total = conn.execute("SELECT COUNT(*) FROM (" + sql + ")", args).fetchone()[0]
+        rows = conn.execute(sql + " ORDER BY name, id LIMIT ?", args + [limit]).fetchall()
+    finally:
+        conn.close()
+    lst = [{"id": r[0], "name": r[1], "lat": r[2], "lon": r[3], "loc": r[4], "parent": r[5] or None, "platform": r[6] or None} for r in rows]
+    return 200, {"status": "OK", "now": now_ms(), "total": total, "n": len(lst), "truncated": total > len(lst), "list": lst}
+
+
+def mavinform_query(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    st = _json_read(MAVINFORM_STORE, {})
+    items = list(st.get("items") or [])
+    since_s = (first(params, "since") or "").strip()
+    if since_s:
+        since = None
+        try:
+            v = float(since_s)
+            since = int(v * 1000) if v < 1e11 else int(v)   # mp vagy ms
+        except ValueError:
+            try:
+                import datetime as _dt
+                d = _dt.datetime.fromisoformat(since_s.replace("Z", "+00:00"))
+                if d.tzinfo is None:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        d = d.replace(tzinfo=ZoneInfo("Europe/Budapest"))
+                    except Exception:
+                        pass
+                since = int(d.timestamp() * 1000)
+            except ValueError:
+                return 400, {"status": "ERROR", "text": "since: epoch s/ms or ISO date"}
+        items = [x for x in items if (x.get("ts") or x.get("first_seen") or 0) >= since]
+    cats = [c.strip() for c in (first(params, "cat") or "").split(",") if c.strip()]
+    if cats:
+        items = [x for x in items if set(cats) & set(x.get("cats") or [])]
+    limit = _int_param(params, "limit", 200, 1, MAVINFORM_MAX_ITEMS)
+    return 200, {"status": "OK", "now": now_ms(), "checked_at": st.get("checked_at"), "last_error": st.get("last_error"),
+                 "categories": [c for c, _ in MAVINFORM_CATS], "n": min(len(items), limit), "total": len(items), "list": items[:limit]}
+
+
 def extract_token(handler: BaseHTTPRequestHandler, params: dict[str, list[str]]) -> str:
     h = handler.headers
     tok = h.get("X-KT-Token") or ""
@@ -1523,6 +2102,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_lastknown(params)
             if path == "/offline":
                 return self._send_offline(params)
+            # srv-volan1: Volán GTFS + MÁVINFORM (csak olvasás)
+            if path == "/api/volan/gtfs/status":
+                return self._send_json(200, volan_status())
+            if path == "/api/volan/routes":
+                return self._send_json(*volan_routes(params))
+            if path == "/api/volan/stops":
+                return self._send_json(*volan_stops(params))
+            if path == "/api/mavinform":
+                return self._send_json(*mavinform_query(params))
 
             futar_ep = match_futar(path)
             if futar_ep:
@@ -1894,6 +2482,8 @@ def main() -> int:
     th.start()
     sl = threading.Thread(target=stats_logger, name="kt-stats", daemon=True)
     sl.start()
+    vw = threading.Thread(target=volan_worker, name="kt-volan", daemon=True)
+    vw.start()
     httpd = ThreadingHTTPServer((BIND, PORT), Handler)
     log("listening http://%s:%s" % (BIND, PORT))
     try:
