@@ -91,6 +91,7 @@ DEPOTS = [
     ("Etele", 47.464017, 19.0224192),
     ("Pevdi", 47.5969396, 18.9527357),
     ("Szigethalom", 47.3317937, 19.0025362),
+    ("javító FÓT", 47.5892031, 19.1497629),  # v1.64: MÁV Személyszállítási Zrt. Fót Autóbuszos Műszaki Telephely (app: „javító FÓT telephely”)
 ]
 
 SECRET_PARAM_RE = re.compile(r"(?i)(key|token|apikey|api_key)=[^&\s]*")
