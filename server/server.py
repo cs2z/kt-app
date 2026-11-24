@@ -234,16 +234,91 @@ def mock_futar_json(endpoint: str, params: dict[str, list[str]]) -> dict:
         sid = "BKK_MOCKSTOP_%s" % px
         stops[sid] = {"id": sid, "name": "Mock megálló %s" % px, "lat": lat, "lon": lon}
     q = (first(params, "query") or "").strip()
+    agencies: dict[str, Any] = {}
     if q:
         qn = norm_plate(q)
         vehicles = [v for v in vehicles if norm_plate(v.get("licensePlate")).startswith(qn) or norm_plate(v.get("licensePlate")) == qn]
+    else:
+        # Szűretlen 20 km (éjszakai Volán-gyűjtés tesztje): prefix buszok + idegen rendszámú Volán + nem-Volán.
+        # Az előtagos hívások query-vel jönnek, ezt az ágat nem érintik.
+        vehicles[0]["vehicleId"] = "volan_mock:%s" % vehicles[0]["licensePlate"]
+        extras = [
+            {
+                "vehicleId": "volan_pig001",
+                "licensePlate": "PIG001",
+                "label": "PIG001",
+                "location": {"lat": CENTER_LAT + 0.02, "lon": CENTER_LON + 0.02},
+                "bearing": 10,
+                "lastUpdateTime": now_i,
+                "status": "STOPPED_AT",
+            },
+            {
+                "vehicleId": "bkk:rdb001",
+                "licensePlate": "RDB001",
+                "label": "RDB001",
+                "location": {"lat": CENTER_LAT + 0.021, "lon": CENTER_LON + 0.021},
+                "bearing": 20,
+                "tripId": "volan_MOCKTRIP_RDB",
+                "routeId": "volan_1000",
+                "lastUpdateTime": now_i,
+                "status": "IN_TRANSIT_TO",
+            },
+            {
+                "vehicleId": "bkk:nkv001",
+                "licensePlate": "NKV001",
+                "label": "NKV001",
+                "location": {"lat": CENTER_LAT + 0.022, "lon": CENTER_LON + 0.022},
+                "bearing": 30,
+                "tripId": "BKK_MOCKTRIP_NKV",
+                "routeId": "BKK_VOLANTEST",
+                "lastUpdateTime": now_i,
+                "status": "IN_TRANSIT_TO",
+            },
+            {
+                "vehicleId": "bkk:bkv001",
+                "licensePlate": "BKV001",
+                "label": "BKV001",
+                "location": {"lat": CENTER_LAT + 0.03, "lon": CENTER_LON + 0.03},
+                "bearing": 40,
+                "tripId": "BKK_MOCKTRIP_BKV",
+                "routeId": "BKK_0090",
+                "lastUpdateTime": now_i,
+                "status": "IN_TRANSIT_TO",
+            },
+            {
+                "vehicleId": "bkk:hev001",
+                "licensePlate": "HEV001",
+                "label": "HEV001",
+                "location": {"lat": CENTER_LAT + 0.031, "lon": CENTER_LON + 0.031},
+                "bearing": 50,
+                "tripId": "BKK_MOCKTRIP_HEV",
+                "routeId": "BKK_H8",
+                "lastUpdateTime": now_i,
+                "status": "IN_TRANSIT_TO",
+            },
+        ]
+        vehicles.extend(extras)
+        trips["volan_MOCKTRIP_RDB"] = {"id": "volan_MOCKTRIP_RDB", "routeId": "volan_1000", "tripHeadsign": "Mock Volán RDB"}
+        trips["BKK_MOCKTRIP_NKV"] = {"id": "BKK_MOCKTRIP_NKV", "routeId": "BKK_VOLANTEST", "tripHeadsign": "Mock Volán NKV"}
+        trips["BKK_MOCKTRIP_BKV"] = {"id": "BKK_MOCKTRIP_BKV", "routeId": "BKK_0090", "tripHeadsign": "Mock BKV"}
+        trips["BKK_MOCKTRIP_HEV"] = {"id": "BKK_MOCKTRIP_HEV", "routeId": "BKK_H8", "tripHeadsign": "Mock HÉV"}
+        routes["volan_1000"] = {"id": "volan_1000", "shortName": "1000", "type": "BUS", "agencyId": "volan_volan"}
+        routes["BKK_VOLANTEST"] = {"id": "BKK_VOLANTEST", "shortName": "VT", "type": "BUS", "agencyId": "volan_volan"}
+        routes["BKK_0090"] = {"id": "BKK_0090", "shortName": "9", "type": "BUS", "agencyId": "BKK_BKV"}
+        routes["BKK_H8"] = {"id": "BKK_H8", "shortName": "H8", "type": "RAIL", "agencyId": "BKK_HEV"}
+        agencies["volan_volan"] = {"id": "volan_volan", "name": "Volánbusz"}
+        agencies["BKK_BKV"] = {"id": "BKK_BKV", "name": "BKV Zrt."}
+        agencies["BKK_HEV"] = {"id": "BKK_HEV", "name": "MÁV Személyszállítási"}
+    refs_body: dict[str, Any] = {"trips": trips, "routes": routes, "stops": stops}
+    if agencies:
+        refs_body["agencies"] = agencies
     body: dict[str, Any] = {
         "currentTime": now_i,
         "version": 3,
         "status": "OK",
         "code": 200,
         "text": "OK",
-        "data": {"limitExceeded": False, "list": vehicles, "references": {"trips": trips, "routes": routes, "stops": stops}},
+        "data": {"limitExceeded": False, "list": vehicles, "references": refs_body},
     }
     if endpoint == "trip-details.json":
         tid = first(params, "tripId") or "BKK_MOCKTRIP_AAGL"
@@ -925,6 +1000,115 @@ def uniq_vehicles(lst: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [seen[k] for k in order]
 
 
+VOLAN_ID_PREFIX = "volan_"
+VOLAN_AGENCY_ID = "volan_volan"
+NIGHT_VOLAN_EVERY_SEC = 10 * 60  # éjszakai szűretlen 20 km-es hívás, legfeljebb ennyinként
+NIGHT_VOLAN_INCLUDE = "trips,routes,agencies"
+_last_night_volan = 0.0
+
+
+def is_volan_vehicle(v: dict[str, Any], refs: Optional[dict[str, Any]] = None) -> bool:
+    """BKK-irányítású Volán: vehicleId/routeId 'volan_' előtag, vagy a járat ügynöksége volan_volan.
+
+    A 'MÁV Személyszállítási' ügynökségnevet nem használjuk (HÉV/vonat is az).
+    Éjszaka leállított busznak gyakran nincs routeId-ja: akkor a vehicleId dönt.
+    """
+    vid = str(v.get("vehicleId") or "")
+    if vid.lower().startswith(VOLAN_ID_PREFIX):
+        return True
+    rid = str(v.get("routeId") or "")
+    if rid.lower().startswith(VOLAN_ID_PREFIX):
+        return True
+    aids: list[str] = []
+    if v.get("agencyId"):
+        aids.append(str(v.get("agencyId") or ""))
+    routes = (refs or {}).get("routes") or {}
+    r = routes.get(rid) if rid else None
+    if isinstance(r, dict) and r.get("agencyId"):
+        aids.append(str(r.get("agencyId") or ""))
+    return any(a.lower() == VOLAN_AGENCY_ID for a in aids)
+
+
+def night_volan_params() -> dict[str, list[str]]:
+    return {
+        "lat": [str(CENTER_LAT)],
+        "lon": [str(CENTER_LON)],
+        "radius": [str(FLEET_RADIUS_CITY)],
+        "includeReferences": [NIGHT_VOLAN_INCLUDE],
+    }
+
+
+def prefix_fleet_plates() -> set[str]:
+    assert STATE is not None
+    snap = STATE.fleet.snapshot()
+    out: set[str] = set()
+    for v in snap["list"] or []:
+        p = norm_plate(v.get("licensePlate"))
+        if p:
+            out.add(p)
+    return out
+
+
+def maybe_fetch_night_volan(now_ms_val: Optional[int] = None, force: bool = False) -> bool:
+    """23:00–03:00 (Europe/Budapest): egy szűretlen 20 km-es vehicles-for-location, max. 10 percenként.
+
+    Csak a Volán járműveket tartja meg, az előtagos flotta rendszámaival deduplikálja,
+    és a night_pos-ba írja (record_live). A flotta-gyorsítótárat, a fleet_history-t
+    és a plate_last-ot nem módosítja. Nem-Volán jármű sehova nem kerül.
+    """
+    global _last_night_volan
+    assert STATE is not None
+    t_ms = now_ms() if now_ms_val is None else now_ms_val
+    if not ktdepot.night_of(t_ms):
+        return False
+    if not force and _last_night_volan and (t_ms / 1000.0 - _last_night_volan) < NIGHT_VOLAN_EVERY_SEC:
+        return False
+    if STATE.backoff.active():
+        log("night_volan_skip backoff remaining=%ss" % int(STATE.backoff.remaining()))
+        return False
+    params = night_volan_params()
+    ck = cache_key("futar", "vehicles-for-location.json", params)
+    respect_min_gap(ck)
+    try:
+        http, body = bkk_get_json("vehicles-for-location.json", params)
+    except Exception as e:
+        log("night_volan_error err=%s" % type(e).__name__)
+        return False
+    # A hívás megtörtént: a 10 perces ritkítás ettől számít, sikertelen választ se ismételjük azonnal.
+    _last_night_volan = t_ms / 1000.0
+    if not isinstance(body, dict):
+        log("night_volan_error err=invalid_body")
+        return False
+    if is_limit_exceeded(http, body):
+        log("night_volan_error err=%s" % (body.get("status") or http))
+        return False
+    if http != 200 or body.get("status") not in (None, "OK"):
+        log("night_volan_error err=http=%s status=%s" % (http, body.get("status")))
+        return False
+    cache_put(ck, CacheEntry("json", body, "application/json", now(), TTL_BY_ENDPOINT["vehicles-for-location.json"], http))
+    data = body.get("data") or {}
+    if data.get("limitExceeded"):
+        log("night_volan note=data.limitExceeded (truncated)")
+    refs = data.get("references") or {}
+    lst = data.get("list") or []
+    volan = [v for v in lst if is_volan_vehicle(v, refs)]
+    uniq = uniq_vehicles(volan)
+    have = prefix_fleet_plates()
+    extra: list[dict[str, Any]] = []
+    for v in uniq:
+        p = norm_plate(v.get("licensePlate"))
+        if not p or p in have:
+            continue
+        extra.append(v)
+    try:
+        n = ktdepot.record_live(STATE.db, STATE.db_lock, extra, t_ms, norm_plate, signal_ms)
+    except Exception as e:
+        log("night_volan_record_error err=%s" % type(e).__name__)
+        return False
+    log("night_volan ok n=%s extra=%s recorded=%s" % (len(volan), len(extra), n))
+    return True
+
+
 def fetch_fleet_once() -> bool:
     """Minimális számú kéréssel frissíti a flotta-gyorsítótárat. 4 előtag × 100 km.
 
@@ -1389,6 +1573,7 @@ def scheduler() -> None:
                 STATE.stop.wait(min(interval, max(1.0, rem)))
                 continue
             fetch_fleet_once()
+            maybe_fetch_night_volan()
         except Exception:
             log("scheduler_error " + redact(traceback.format_exc().splitlines()[-1] if traceback.format_exc() else "err"))
         elapsed = now() - t0
