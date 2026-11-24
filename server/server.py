@@ -13,6 +13,9 @@ import re
 import secrets
 import sqlite3
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import depot as ktdepot  # KKMD-4: tárolók (server/depot.py)
 import threading
 import time
 import traceback
@@ -78,7 +81,7 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot"]
 
 # v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
 LASTKNOWN_R_DEFAULT = 1500
@@ -534,6 +537,7 @@ class State:
             conn.execute("ALTER TABLE plate_last ADD COLUMN sig INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_lat_lon ON plate_last(lat, lon)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_ts ON plate_last(ts)")
+        ktdepot.init_db(conn)  # KKMD-4: night_pos, depot_candidate, depot, plate_depot, depot_meta
         # indulási feltöltés a meglévő fleet_history-ból (rendszámonként a legutolsó sor; az első látás = legkorábbi sor)
         conn.execute(
             """
@@ -1008,6 +1012,10 @@ def route_name(v: dict[str, Any], refs: dict[str, Any]) -> str:
 
 def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
     assert STATE is not None
+    try:  # KKMD-4: éjszakai helyek (23:00–03:00) a már lekért flottából – nincs külön BKK-hívás
+        ktdepot.record_live(STATE.db, STATE.db_lock, lst, now_ms(), norm_plate, signal_ms)
+    except Exception as e:
+        log("depot_record_error err=%s" % type(e).__name__)
     ts = now_ms()
     rows = []
     sigs: dict[str, tuple[int, int]] = {}  # v1.37: rendszám → (a busz saját jelének ideje ms, sig)
@@ -1362,8 +1370,16 @@ def scheduler() -> None:
     while not STATE.stop.is_set():
         t0 = now()
         try:
+            try:  # KKMD-4: éjszakai OFF-pillanatkép + 03:15-ös klaszterezés (naponta egyszer)
+                ktdepot.tick(STATE.db, STATE.db_lock, now_ms(), log)
+            except Exception as e:
+                log("depot_tick_error err=%s" % type(e).__name__)
             if now() - last_prune > 3600:
                 prune_history()
+                try:
+                    ktdepot.prune(STATE.db, STATE.db_lock, now_ms())
+                except Exception:
+                    pass
                 last_prune = now()
             interval = STATE.desired_poll()
             STATE.poll_interval = interval
@@ -2102,6 +2118,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_lastknown(params)
             if path == "/offline":
                 return self._send_offline(params)
+            if path == "/depots":  # KKMD-4
+                return self._send_json(200, {"status": "OK", "now": now_ms(), "depots": ktdepot.list_depots(STATE.db, STATE.db_lock)})
+            if path == "/depot/candidates":
+                return self._send_json(200, {"status": "OK", "now": now_ms(), "candidates": ktdepot.list_candidates(STATE.db, STATE.db_lock)})
             # srv-volan1: Volán GTFS + MÁVINFORM (csak olvasás)
             if path == "/api/volan/gtfs/status":
                 return self._send_json(200, volan_status())
@@ -2149,6 +2169,17 @@ class Handler(BaseHTTPRequestHandler):
             tok = extract_token(self, params)
             if not authorized(tok):
                 return self._send_json(401, {"status": "UNAUTHORIZED", "text": "missing or invalid token"})
+            if path in ("/depot/approve", "/depot/rename", "/depot/delete"):  # KKMD-4 (tokenes írás)
+                STATE.mark_client()
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except Exception:
+                    return self._send_json(400, {"status": "ERROR", "text": "invalid json"})
+                if not isinstance(body, dict):
+                    return self._send_json(400, {"status": "ERROR", "text": "invalid json"})
+                code, obj = ktdepot.write(STATE.db, STATE.db_lock, path, body, now_ms())
+                log("depot_write path=%s code=%s" % (path, code))
+                return self._send_json(code, obj)
             if not path.startswith("/sync/"):
                 return self._send_json(404, {"status": "NOT_FOUND", "text": "unknown path"})
             STATE.mark_client()
