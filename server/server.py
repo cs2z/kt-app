@@ -81,7 +81,7 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot", "volan-extra"]
 
 # v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
 LASTKNOWN_R_DEFAULT = 1500
@@ -518,6 +518,31 @@ class FleetCache:
         self.notes: list[str] = []
         self.mode: str = ""
         self.bkk_calls: int = 0
+        # KKMD-18: idegen rendszámú Volán buszok (az éjszakai 20 km-es hívásból), rendszám → (jármű, gyűjtés ideje ms)
+        self.extra: dict[str, tuple[dict[str, Any], int]] = {}
+        self.extra_refs: dict[str, Any] = {"trips": {}, "routes": {}}
+
+    def set_extra(self, lst: list[dict[str, Any]], refs: dict[str, Any], t_ms: int) -> None:
+        """Az éjszakai hívás teljes Volán-extra készlete felváltja az előzőt (ami nincs benne, az már nincs a 20 km-en belül)."""
+        ex: dict[str, tuple[dict[str, Any], int]] = {}
+        for v in lst:
+            p = norm_plate(v.get("licensePlate"))
+            if p:
+                w = dict(v)
+                w["ktVolanExtra"] = True
+                ex[p] = (w, int(t_ms))
+        tr = {k: x for k, x in ((refs or {}).get("trips") or {}).items() if any(e[0].get("tripId") == k for e in ex.values())}
+        ro = {k: x for k, x in ((refs or {}).get("routes") or {}).items() if any(e[0].get("routeId") == k for e in ex.values())}
+        with self.lock:
+            self.extra = ex
+            self.extra_refs = {"trips": tr, "routes": ro}
+
+    def _extra_live(self, base_plates: set[str]) -> list[dict[str, Any]]:
+        t = now_ms()
+        return [
+            v for p, (v, ts) in sorted(self.extra.items())
+            if p not in base_plates and t - ts <= VOLAN_EXTRA_TTL_SEC * 1000
+        ]
 
     def set(
         self,
@@ -538,11 +563,25 @@ class FleetCache:
             self.notes = notes
             self.bkk_calls = bkk_calls
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, include_extra: bool = True, only_extra: bool = False) -> dict[str, Any]:
         with self.lock:
+            lst, refs = self.list, self.refs
+            if include_extra or only_extra:
+                base = {norm_plate(v.get("licensePlate")) for v in self.list}
+                ex = self._extra_live(base)
+                if only_extra:
+                    lst = ex
+                    refs = {"trips": dict(self.extra_refs.get("trips") or {}), "routes": dict(self.extra_refs.get("routes") or {})}
+                elif ex:
+                    lst = list(self.list) + ex
+                    refs = dict(self.refs)
+                    for k in ("trips", "routes"):
+                        d = dict(refs.get(k) or {})
+                        d.update(self.extra_refs.get(k) or {})
+                        refs[k] = d
             return {
-                "list": self.list,
-                "refs": self.refs,
+                "list": lst,
+                "refs": refs,
                 "fetched_at": self.fetched_at,
                 "current_time": self.current_time,
                 "ok": self.ok,
@@ -612,6 +651,10 @@ class State:
             conn.execute("ALTER TABLE plate_last ADD COLUMN sig INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_lat_lon ON plate_last(lat, lon)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_plate_last_ts ON plate_last(ts)")
+        # KKMD-18: az éjszakai 20 km-es hívásban látott idegen rendszámú Volán buszok (a kliens ezeket az előtag-szabálytól függetlenül mutatja)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS volan_extra (plate TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL)"
+        )
         ktdepot.init_db(conn)  # KKMD-4: night_pos, depot_candidate, depot, plate_depot, depot_meta
         # indulási feltöltés a meglévő fleet_history-ból (rendszámonként a legutolsó sor; az első látás = legkorábbi sor)
         conn.execute(
@@ -1004,6 +1047,8 @@ VOLAN_ID_PREFIX = "volan_"
 VOLAN_AGENCY_ID = "volan_volan"
 NIGHT_VOLAN_EVERY_SEC = 10 * 60  # éjszakai szűretlen 20 km-es hívás, legfeljebb ennyinként
 NIGHT_VOLAN_INCLUDE = "trips,routes,agencies"
+# KKMD-18: az extra buszok ennyi ideig maradnak az élő flotta-tárban a legutóbbi éjszakai hívás után (2 hívásnyi idő)
+VOLAN_EXTRA_TTL_SEC = 2 * NIGHT_VOLAN_EVERY_SEC
 _last_night_volan = 0.0
 
 
@@ -1040,7 +1085,7 @@ def night_volan_params() -> dict[str, list[str]]:
 
 def prefix_fleet_plates() -> set[str]:
     assert STATE is not None
-    snap = STATE.fleet.snapshot()
+    snap = STATE.fleet.snapshot(include_extra=False)
     out: set[str] = set()
     for v in snap["list"] or []:
         p = norm_plate(v.get("licensePlate"))
@@ -1053,8 +1098,9 @@ def maybe_fetch_night_volan(now_ms_val: Optional[int] = None, force: bool = Fals
     """23:00–03:00 (Europe/Budapest): egy szűretlen 20 km-es vehicles-for-location, max. 10 percenként.
 
     Csak a Volán járműveket tartja meg, az előtagos flotta rendszámaival deduplikálja,
-    és a night_pos-ba írja (record_live). A flotta-gyorsítótárat, a fleet_history-t
-    és a plate_last-ot nem módosítja. Nem-Volán jármű sehova nem kerül.
+    és a night_pos-ba írja (record_live). KKMD-18: ezek az idegen rendszámú Volán buszok
+    az élő flotta-tárba (ktVolanExtra jelöléssel, VOLAN_EXTRA_TTL_SEC-ig), a fleet_history-ba
+    és a plate_last-ba is bekerülnek, mint az előtagos buszok. Nem-Volán jármű sehova nem kerül.
     """
     global _last_night_volan
     assert STATE is not None
@@ -1105,8 +1151,44 @@ def maybe_fetch_night_volan(now_ms_val: Optional[int] = None, force: bool = Fals
     except Exception as e:
         log("night_volan_record_error err=%s" % type(e).__name__)
         return False
+    try:
+        volan_extra_store(extra, refs, t_ms)
+    except Exception as e:
+        log("night_volan_extra_error err=%s" % type(e).__name__)
     log("night_volan ok n=%s extra=%s recorded=%s" % (len(volan), len(extra), n))
     return True
+
+
+_VOLAN_EXTRA_SET: Optional[set[str]] = None
+
+
+def volan_extra_plates() -> set[str]:
+    """KKMD-18: az eddig látott idegen rendszámú Volán buszok (volan_extra tábla), memóriában tartva."""
+    global _VOLAN_EXTRA_SET
+    assert STATE is not None
+    if _VOLAN_EXTRA_SET is None:
+        with STATE.db_lock:
+            _VOLAN_EXTRA_SET = {r[0] for r in STATE.db.execute("SELECT plate FROM volan_extra")}
+    return _VOLAN_EXTRA_SET
+
+
+def volan_extra_store(extra: list[dict[str, Any]], refs: dict[str, Any], t_ms: int) -> None:
+    """KKMD-18: az éjszakai hívás idegen rendszámú Volán buszai → élő flotta-tár, fleet_history, plate_last, volan_extra.
+    A night_pos-t a hívó már írta (record_live), ezért a store_history itt nem írja újra."""
+    assert STATE is not None
+    STATE.fleet.set_extra(extra, refs, t_ms)
+    if not extra:
+        return
+    store_history(extra, refs, depot=False, poll_ms=t_ms)
+    ps = sorted({norm_plate(v.get("licensePlate")) for v in extra if norm_plate(v.get("licensePlate"))})
+    with STATE.db_lock:
+        STATE.db.executemany(
+            "INSERT INTO volan_extra(plate, first_seen, last_seen) VALUES (?,?,?) "
+            "ON CONFLICT(plate) DO UPDATE SET last_seen=MAX(volan_extra.last_seen, excluded.last_seen)",
+            [(p, int(t_ms), int(t_ms)) for p in ps],
+        )
+        STATE.db.commit()
+    volan_extra_plates().update(ps)
 
 
 def fetch_fleet_once() -> bool:
@@ -1194,13 +1276,14 @@ def route_name(v: dict[str, Any], refs: dict[str, Any]) -> str:
     return rid or ""
 
 
-def store_history(lst: list[dict[str, Any]], refs: dict[str, Any]) -> None:
+def store_history(lst: list[dict[str, Any]], refs: dict[str, Any], depot: bool = True, poll_ms: Optional[int] = None) -> None:
     assert STATE is not None
-    try:  # KKMD-4: éjszakai helyek (23:00–03:00) a már lekért flottából – nincs külön BKK-hívás
-        ktdepot.record_live(STATE.db, STATE.db_lock, lst, now_ms(), norm_plate, signal_ms)
-    except Exception as e:
-        log("depot_record_error err=%s" % type(e).__name__)
-    ts = now_ms()
+    if depot:
+        try:  # KKMD-4: éjszakai helyek (23:00–03:00) a már lekért flottából – nincs külön BKK-hívás
+            ktdepot.record_live(STATE.db, STATE.db_lock, lst, now_ms(), norm_plate, signal_ms)
+        except Exception as e:
+            log("depot_record_error err=%s" % type(e).__name__)
+    ts = now_ms() if poll_ms is None else int(poll_ms)
     rows = []
     sigs: dict[str, tuple[int, int]] = {}  # v1.37: rendszám → (a busz saját jelének ideje ms, sig)
     for v in lst:
@@ -1369,6 +1452,8 @@ def _pl_row(r: Any, t_now: int, lat0: Optional[float] = None, lon0: Optional[flo
         "depot": dep,
         "depotDist": dd,
     }
+    if r[0] in volan_extra_plates():
+        o["volanExtra"] = True  # KKMD-18: idegen rendszámú Volán busz (nem előtagos)
     if lat0 is not None and lon0 is not None and r[2] is not None and r[3] is not None:
         o["dist"] = int(round(haversine_m(lat0, lon0, r[2], r[3])))
     return o
@@ -2296,7 +2381,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/stats":
                 return self._send_stats()
             if path == "/fleet":
-                return self._send_fleet()
+                return self._send_fleet(params)
             if path == "/history":
                 return self._send_history(params)
             if path == "/lastknown":
@@ -2492,9 +2577,11 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def _send_fleet(self) -> None:
+    def _send_fleet(self, params: Optional[dict[str, list[str]]] = None) -> None:
         assert STATE is not None
-        snap = STATE.fleet.snapshot()
+        # KKMD-18: /fleet?extra=1 → csak az idegen rendszámú Volán buszok (az előtagos lekérdezések ezeket nem adják vissza)
+        only_extra = (first(params or {}, "extra") or "") in ("1", "true")
+        snap = STATE.fleet.snapshot(only_extra=only_extra)
         if not snap["ok"] or not snap["fetched_at"]:
             return self._send_json(
                 503,
@@ -2539,7 +2626,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return None
         rows = history_query(plate, maybe_int("from"), maybe_int("to"), maybe_int("limit") or 5000)
-        self._send_json(200, {"status": "OK", "plate": norm_plate(plate), "n": len(rows), "points": rows})
+        body = {"status": "OK", "plate": norm_plate(plate), "n": len(rows), "points": rows}
+        if norm_plate(plate) in volan_extra_plates():
+            body["volanExtra"] = True  # KKMD-18
+        self._send_json(200, body)
 
     def _send_lastknown(self, params: dict[str, list[str]]) -> None:
         def num(name: str) -> Optional[float]:
