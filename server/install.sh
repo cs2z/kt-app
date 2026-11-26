@@ -255,6 +255,40 @@ prompt_bkk_key() {
   fi
 }
 
+# srv-mav1: MÁV GTFS hozzáférés (basic auth). A meglévő érték megmarad; ha nincs, rejtett bekérés (Enter = kihagyás).
+# Kihagyva a szerver /health-ben "mav-gtfs": "no-credentials"-t jelez, minden más működik.
+prompt_mav_creds() {
+  local eu ep
+  eu="$(read_env_var "$ENV_FILE" "MAV_GTFS_USER" || true)"
+  ep="$(read_env_var "$ENV_FILE" "MAV_GTFS_PASSWORD" || true)"
+  [[ -n "${MAV_GTFS_USER:-}" ]] || MAV_GTFS_USER="$eu"
+  [[ -n "${MAV_GTFS_PASSWORD:-}" ]] || MAV_GTFS_PASSWORD="$ep"
+  if [[ -n "$MAV_GTFS_USER" && -n "$MAV_GTFS_PASSWORD" ]]; then
+    say "A MÁV GTFS hozzáférés megmarad (/etc/kt-server/env)."
+    return 0
+  fi
+  if [[ "${KT_SKIP_PROMPT:-0}" == "1" || ! -e /dev/tty ]]; then
+    warn "Nincs MÁV GTFS hozzáférés megadva – a vonatkereső adat nélkül marad (mav-gtfs: no-credentials)."
+    MAV_GTFS_USER=""; MAV_GTFS_PASSWORD=""
+    return 0
+  fi
+  printf '%s\n' "MÁV GTFS hozzáférés (a vonatkeresőhöz). Üres Enter = kihagyás." > /dev/tty
+  printf 'MÁV GTFS felhasználó (e-mail): ' > /dev/tty
+  read -r MAV_GTFS_USER < /dev/tty
+  if [[ -z "${MAV_GTFS_USER// }" ]]; then
+    MAV_GTFS_USER=""; MAV_GTFS_PASSWORD=""
+    warn "Kihagyva – mav-gtfs: no-credentials."
+    return 0
+  fi
+  printf 'MÁV GTFS jelszó (nem látszik): ' > /dev/tty
+  read -r -s MAV_GTFS_PASSWORD < /dev/tty
+  printf '\n' > /dev/tty
+  if [[ -z "${MAV_GTFS_PASSWORD// }" ]]; then
+    MAV_GTFS_USER=""; MAV_GTFS_PASSWORD=""
+    warn "Üres jelszó – kihagyva (mav-gtfs: no-credentials)."
+  fi
+}
+
 write_env_and_token() {
   local host extra token_is_new=0
   host="$(read_env_var "$ENV_FILE" "KT_HOST" || true)"
@@ -266,7 +300,7 @@ write_env_and_token() {
   umask 077
   install -d -m 0750 "$ETC_DIR"
   # env írása pythonnal, a kulcsot nem echozzuk
-  BKK_API_KEY="$BKK_API_KEY" KT_WRITE_HOST="$host" KT_WRITE_EXTRA="$extra" KT_WRITE_DATA="$DATA_DIR" \
+  BKK_API_KEY="$BKK_API_KEY" MAV_GTFS_USER="${MAV_GTFS_USER:-}" MAV_GTFS_PASSWORD="${MAV_GTFS_PASSWORD:-}" KT_WRITE_HOST="$host" KT_WRITE_EXTRA="$extra" KT_WRITE_DATA="$DATA_DIR" \
   KT_WRITE_LOG="$LOG_DIR" KT_WRITE_TOKEN_FILE="$TOKEN_FILE" \
   python3 - "$ENV_FILE" << 'PY'
 import os, pathlib, tempfile, sys
@@ -288,6 +322,8 @@ lines = [
     "KT_HISTORY_DAYS=7",
     "KT_TOKEN_REQUIRED=1",
 ]
+if os.environ.get("MAV_GTFS_USER") and os.environ.get("MAV_GTFS_PASSWORD"):
+    lines += ["MAV_GTFS_USER=" + os.environ["MAV_GTFS_USER"], "MAV_GTFS_PASSWORD=" + os.environ["MAV_GTFS_PASSWORD"]]
 # Path-ok a valódi (nem PREFIX-elt) helyre mutassanak systemd alatt;
 # dry-runban a PREFIX-elt útvonalak kellenek, ezt a hívó már beállította.
 text = "\n".join(lines) + "\n"
@@ -473,6 +509,7 @@ sync_repo
 install_helpers
 setup_venv
 prompt_bkk_key
+prompt_mav_creds
 write_env_and_token
 setup_caddy
 setup_systemd

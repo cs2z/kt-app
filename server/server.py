@@ -81,7 +81,7 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot", "volan-extra", "volan-tt", "volan-trip"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot", "volan-extra", "volan-tt", "volan-trip", "mav-gtfs"]
 
 # v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
 LASTKNOWN_R_DEFAULT = 1500
@@ -121,6 +121,10 @@ def redact(s: str) -> str:
     if token:
         s = s.replace(token, "[redacted]")
         s = s.replace(urllib.parse.quote(token, safe=""), "[redacted]")
+    mpw = os.environ.get("MAV_GTFS_PASSWORD") or ""
+    if mpw:
+        s = s.replace(mpw, "[redacted]")
+        s = s.replace(urllib.parse.quote(mpw, safe=""), "[redacted]")
     s = SECRET_PARAM_RE.sub(r"\1=[redacted]", s)
     s = SYNC_PATH_RE.sub("/sync/[id]", s)
     return s
@@ -2820,6 +2824,478 @@ def authorized(tok: str) -> bool:
     return secrets.compare_digest(tok, STATE.token)
 
 
+# ===================== srv-mav1: MAV vasúti GTFS (napi letöltés + kompakt API) =====================
+# Forrás: KT_MAV_GTFS_URL (alap: a MAV-csoport GTFS-e), HTTP basic auth a VPS környezetéből: MAV_GTFS_USER + MAV_GTFS_PASSWORD.
+# A jelszó SEHOL nem kerül a kódba, naplóba, meta-fájlba, /health-be. Hiányzó változónál /health "mav-gtfs": "no-credentials".
+MAV_DIR = DATA_DIR / "mav"
+MAV_GTFS_URL = (os.environ.get("KT_MAV_GTFS_URL") or "https://www.mavcsoport.hu/gtfs/gtfsMavMenetrend.zip").strip()
+MAV_GTFS_ZIP = MAV_DIR / "gtfsMavMenetrend.zip"
+MAV_GTFS_META = MAV_DIR / "mav_meta.json"
+MAV_GTFS_DB = MAV_DIR / "mav_index.sqlite"
+MAV_GTFS_AT = os.environ.get("KT_MAV_GTFS_AT", "04:30")          # Budapest idő, napi letöltés (a feed ~04:02-kor készül)
+MAV_GTFS_MAX_AGE = 24 * 3600
+MAV_GTFS_MAX_BYTES = int(os.environ.get("KT_MAV_GTFS_MAX_BYTES", str(200 * 1024 * 1024)))
+MAV_MIN_FREE_BYTES = int(os.environ.get("KT_MAV_MIN_FREE", str(300 * 1024 * 1024)))
+MAV_SHAPE_TOL_M = float(os.environ.get("KT_MAV_SHAPE_TOL_M") or "15")
+MAV_DB_VER = "mav1"
+_MAV_LOCK = threading.Lock()
+_MAV_RUN = {"busy": False}
+_MAV_NUM_RE = re.compile(r"^\s*(?:([^\W\d_][\w.]*)\s+)?(\d{1,6})\b\s*(.*)$", re.UNICODE)
+
+
+def mav_creds() -> tuple[str, str]:
+    return ((os.environ.get("MAV_GTFS_USER") or "").strip(), os.environ.get("MAV_GTFS_PASSWORD") or "")
+
+
+def mav_net_enabled() -> bool:
+    if (os.environ.get("KT_MAV_DISABLE") or "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if not is_mock():
+        return True
+    return bool(os.environ.get("KT_MAV_GTFS_URL"))   # KTMOCK: csak helyi / teszt forrással
+
+
+def mav_meta() -> dict[str, Any]:
+    return _json_read(MAV_GTFS_META, {})
+
+
+def _mav_ready() -> bool:
+    if not MAV_GTFS_DB.exists():
+        return False
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(MAV_GTFS_DB)), uri=True, timeout=5)
+        try:
+            r = c.execute("SELECT v FROM mmeta WHERE k='ver'").fetchone()
+            return bool(r and r[0] == MAV_DB_VER)
+        finally:
+            c.close()
+    except Exception:
+        return False
+
+
+def mav_health() -> str:
+    """ok / no-credentials / downloading / no-data / disabled / error:<Típus> / auth-failed"""
+    m = mav_meta()
+    ready = _mav_ready()
+    u, pw = mav_creds()
+    need_creds = not MAV_GTFS_URL.startswith("file:")
+    if ready and not (m.get("last_error")):
+        return "ok"
+    if not mav_net_enabled():
+        return "ok" if ready else "disabled"
+    if need_creds and not (u and pw):
+        return "no-credentials" if not ready else "ok-stale:no-credentials"
+    if _MAV_RUN["busy"] and not ready:
+        return "downloading"
+    err = m.get("last_error")
+    if err:
+        return ("ok-stale:" if ready else "") + ("auth-failed" if err == "auth_failed" else "error:" + str(err))
+    return "ok" if ready else "no-data"
+
+
+def _mav_fold(s: Optional[str]) -> str:
+    return fold(s or "")
+
+
+def _mav_parse_route(short: str, long_: str) -> tuple[str, str, str]:
+    """(kind, num, name): 'IC 935 SAVARIA' → ('IC','935','SAVARIA'); 'Sz 30127' → ('Sz','30127',''); '1343' → ('','1343',''); 'MÁTRA' → ('','','MÁTRA')."""
+    t = (long_ or "").strip()
+    m = _MAV_NUM_RE.match(t) if t else None
+    if m:
+        return (m.group(1) or "", m.group(2), (m.group(3) or "").strip())
+    return ("", "", t)
+
+
+def _mav_build_index(zpath: Path, db_tmp: Path) -> dict[str, Any]:
+    import csv
+    import io
+    import zipfile
+    if db_tmp.exists():
+        db_tmp.unlink()
+    conn = sqlite3.connect(str(db_tmp))
+    try:
+        c = conn.cursor()
+        c.executescript("""
+            PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+            CREATE TABLE mmeta(k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE magency(id TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE mroute(id TEXT PRIMARY KEY, ag TEXT, short TEXT, long TEXT, kind TEXT, num TEXT, name TEXT, nf TEXT, typ INT, color TEXT);
+            CREATE TABLE mcal(sid TEXT PRIMARY KEY, days INT, d0 TEXT, d1 TEXT);
+            CREATE TABLE mstop(id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL);
+            CREATE TABLE mtrip(id TEXT PRIMARY KEY, rid TEXT, sid TEXT, hs TEXT, shape TEXT, dep INT, arr INT, s0 TEXT, s1 TEXT, n INT);
+            CREATE TABLE mst(tid TEXT, seq INT, stop TEXT, arr INT, dep INT);
+            CREATE TABLE mshape(id TEXT PRIMARY KEY, p TEXT, n INT);
+        """)
+        with zipfile.ZipFile(str(zpath)) as zf:
+            names = set(zf.namelist())
+            for need in ("routes.txt", "trips.txt", "stops.txt", "stop_times.txt", "calendar.txt"):
+                if need not in names:
+                    raise RuntimeError("missing_" + need.split(".")[0])
+
+            def rows(name: str):
+                with zf.open(name) as fh:
+                    yield from csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig", newline=""))
+            if "agency.txt" in names:
+                c.executemany("INSERT OR REPLACE INTO magency VALUES (?,?)", [(r.get("agency_id") or "", r.get("agency_name") or "") for r in rows("agency.txt")])
+            rr = []
+            for r in rows("routes.txt"):
+                short = (r.get("route_short_name") or "").strip()
+                long_ = (r.get("route_long_name") or "").strip()
+                kind, num, name = _mav_parse_route(short, long_)
+                nf = _mav_fold(" ".join(x for x in (short, kind, num, name) if x))
+                try:
+                    typ = int(r.get("route_type") or 2)
+                except ValueError:
+                    typ = 2
+                rr.append((r["route_id"], r.get("agency_id") or "", short, long_, kind, num, name, nf, typ, (r.get("route_color") or "").strip()))
+            c.executemany("INSERT OR REPLACE INTO mroute VALUES (?,?,?,?,?,?,?,?,?,?)", rr)
+            cal = []
+            for r in rows("calendar.txt"):
+                d = 0
+                for i, k in enumerate(("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")):
+                    if (r.get(k) or "0").strip() == "1":
+                        d |= 1 << i
+                cal.append((r["service_id"], d, (r.get("start_date") or "").strip(), (r.get("end_date") or "").strip()))
+            c.executemany("INSERT OR REPLACE INTO mcal VALUES (?,?,?,?)", cal)
+            c.executemany("INSERT OR REPLACE INTO mstop VALUES (?,?,?,?)",
+                          [(r["stop_id"], (r.get("stop_name") or "").strip(), float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0)) for r in rows("stops.txt")])
+            tr = [(r["trip_id"], r["route_id"], r.get("service_id") or "", (r.get("trip_headsign") or "").strip(), (r.get("shape_id") or "").strip())
+                  for r in rows("trips.txt")]
+            c.executemany("INSERT OR REPLACE INTO mtrip(id,rid,sid,hs,shape) VALUES (?,?,?,?,?)", tr)
+            buf = []
+            for r in rows("stop_times.txt"):
+                try:
+                    seq = int(r.get("stop_sequence") or 0)
+                except ValueError:
+                    continue
+                a = _gtfs_secs(r.get("arrival_time") or "")
+                dd = _gtfs_secs(r.get("departure_time") or "")
+                buf.append((r["trip_id"], seq, r.get("stop_id") or "", a if a is not None else dd, dd if dd is not None else a))
+                if len(buf) >= 20000:
+                    c.executemany("INSERT INTO mst VALUES (?,?,?,?,?)", buf)
+                    buf = []
+            if buf:
+                c.executemany("INSERT INTO mst VALUES (?,?,?,?,?)", buf)
+            c.execute("CREATE INDEX mst_t ON mst(tid, seq)")
+            # menet-összegzés: első indulás, utolsó érkezés, végpontok, megállószám
+            c.execute("""UPDATE mtrip SET
+                dep=(SELECT dep FROM mst WHERE mst.tid=mtrip.id ORDER BY seq LIMIT 1),
+                s0=(SELECT stop FROM mst WHERE mst.tid=mtrip.id ORDER BY seq LIMIT 1),
+                arr=(SELECT arr FROM mst WHERE mst.tid=mtrip.id ORDER BY seq DESC LIMIT 1),
+                s1=(SELECT stop FROM mst WHERE mst.tid=mtrip.id ORDER BY seq DESC LIMIT 1),
+                n=(SELECT COUNT(*) FROM mst WHERE mst.tid=mtrip.id)""")
+            nsh = 0
+            if "shapes.txt" in names:
+                cur_id, pts = None, []
+
+                def flush(sid, p):
+                    if not sid or len(p) < 2:
+                        return 0
+                    p.sort(key=lambda x: x[0])
+                    q = _dp_simplify([[a, b] for _, a, b in p], MAV_SHAPE_TOL_M)
+                    c.execute("INSERT OR REPLACE INTO mshape VALUES (?,?,?)", (sid, _poly_enc(q), len(q)))
+                    return 1
+                for r in rows("shapes.txt"):   # a fájl shape_id szerint rendezett → folyamos feldolgozás
+                    try:
+                        sid, q = r["shape_id"], (int(float(r.get("shape_pt_sequence") or 0)), float(r["shape_pt_lat"]), float(r["shape_pt_lon"]))
+                    except (ValueError, KeyError):
+                        continue
+                    if sid != cur_id:
+                        nsh += flush(cur_id, pts)
+                        cur_id, pts = sid, []
+                    pts.append(q)
+                nsh += flush(cur_id, pts)
+            c.execute("CREATE INDEX mroute_num ON mroute(num)")
+            c.execute("CREATE INDEX mroute_short ON mroute(short)")
+            c.execute("CREATE INDEX mtrip_rid ON mtrip(rid)")
+            fi = {}
+            if "feed_info.txt" in names:
+                for r in rows("feed_info.txt"):
+                    fi = {k: (v or "").strip() for k, v in r.items() if k}
+                    break
+            cnt = {k: c.execute("SELECT COUNT(*) FROM " + t).fetchone()[0] for k, t in
+                   (("routes", "mroute"), ("trips", "mtrip"), ("stops", "mstop"), ("stop_times", "mst"), ("services", "mcal"))}
+            cnt["shapes"] = nsh
+            c.executemany("INSERT OR REPLACE INTO mmeta VALUES (?,?)", [("ver", MAV_DB_VER), ("feed_version", fi.get("feed_version", "")),
+                                                                         ("valid_from", fi.get("feed_start_date", "")), ("valid_to", fi.get("feed_end_date", ""))])
+        conn.commit()
+        return {"counts": cnt, "feed_version": fi.get("feed_version", ""), "valid_from": fi.get("feed_start_date", ""), "valid_to": fi.get("feed_end_date", "")}
+    finally:
+        conn.close()
+
+
+def _mav_note(err: str) -> None:
+    m = mav_meta()
+    m["checked_at"] = now_ms()
+    m["last_result"] = "error"
+    m["last_error"] = err
+    try:
+        MAV_DIR.mkdir(parents=True, exist_ok=True)
+        _json_write_atomic(MAV_GTFS_META, m)
+    except Exception:
+        pass
+
+
+def _mav_redact(s: str) -> str:
+    u, pw = mav_creds()
+    s = redact(s or "")
+    if pw:
+        s = s.replace(pw, "[redacted]").replace(urllib.parse.quote(pw, safe=""), "[redacted]")
+    return s
+
+
+def mav_update(force: bool = False) -> bool:
+    """Napi letöltés basic auth-tal; ellenőrzés + indexépítés után atomi csere. A hitelesítő adat csak a kérés fejlécében él."""
+    import base64
+    import hashlib
+    import shutil
+    if _MAV_RUN["busy"]:
+        return False
+    _MAV_RUN["busy"] = True
+    MAV_DIR.mkdir(parents=True, exist_ok=True)
+    part = MAV_DIR / "gtfsMavMenetrend.zip.part"
+    db_tmp = MAV_DIR / "mav_index.sqlite.tmp"
+    old = mav_meta()
+    t0 = now()
+    try:
+        u, pw = mav_creds()
+        is_file = MAV_GTFS_URL.startswith("file:")
+        if not is_file and not (u and pw):
+            log("mav_gtfs_skip no_credentials (MAV_GTFS_USER / MAV_GTFS_PASSWORD nincs beállítva)")
+            _mav_note("no_credentials")
+            return False
+        try:
+            free = shutil.disk_usage(MAV_DIR).free
+            if free < MAV_MIN_FREE_BYTES:
+                log("mav_gtfs_skip low_disk free_mb=%s" % (free // (1 << 20)))
+                _mav_note("low_disk")
+                return False
+        except Exception:
+            pass
+        hdr = {"User-Agent": VOLAN_UA, "Accept": "application/zip"}
+        if u and pw and not is_file:
+            hdr["Authorization"] = "Basic " + base64.b64encode((u + ":" + pw).encode("utf-8")).decode("ascii")
+
+        class _NoAuthRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):   # más hostra az Authorization ne menjen át
+                nr = super().redirect_request(req, fp, code, msg, headers, newurl)
+                if nr is not None and urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+                    nr.headers.pop("Authorization", None)
+                    nr.unredirected_hdrs.pop("Authorization", None)
+                return nr
+        opener = urllib.request.build_opener(_NoAuthRedirect)
+        h = hashlib.sha256()
+        size = 0
+        try:
+            resp = opener.open(urllib.request.Request(MAV_GTFS_URL, headers=hdr), timeout=90)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                log("mav_gtfs_error auth_failed http=%s" % e.code)
+                _mav_note("auth_failed")
+                return False
+            raise
+        with resp, open(part, "wb") as f:
+            while True:
+                b = resp.read(1 << 20)
+                if not b:
+                    break
+                size += len(b)
+                if size > MAV_GTFS_MAX_BYTES:
+                    raise RuntimeError("gtfs_too_large")
+                h.update(b)
+                f.write(b)
+        sha = h.hexdigest()
+        dl_sec = round(now() - t0, 1)
+        if not force and sha == old.get("sha256") and _mav_ready():
+            old.update({"checked_at": now_ms(), "last_result": "unchanged", "last_error": None})
+            _json_write_atomic(MAV_GTFS_META, old)
+            log("mav_gtfs unchanged size=%s sec=%s" % (size, dl_sec))
+            return True
+        info = _mav_build_index(part, db_tmp)
+        with _MAV_LOCK:
+            os.replace(part, MAV_GTFS_ZIP)
+            os.replace(db_tmp, MAV_GTFS_DB)
+            meta = {"source": "mavcsoport" if MAV_GTFS_URL.startswith("http") else "local", "downloaded_at": now_ms(), "checked_at": now_ms(),
+                    "last_result": "updated", "last_error": None, "size": size, "sha256": sha, "download_sec": dl_sec,
+                    "index_sec": round(now() - t0 - dl_sec, 1)}
+            meta.update(info)
+            _json_write_atomic(MAV_GTFS_META, meta)
+        c = info["counts"]
+        log("mav_gtfs updated size=%s routes=%s trips=%s stops=%s shapes=%s sec=%s" % (size, c["routes"], c["trips"], c["stops"], c["shapes"], round(now() - t0, 1)))
+        return True
+    except Exception as e:
+        log("mav_gtfs_error err=%s %s" % (type(e).__name__, _mav_redact(str(e))[:120]))
+        _mav_note(type(e).__name__)
+        return False
+    finally:
+        _MAV_RUN["busy"] = False
+        for p in (part, db_tmp):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+def mav_worker() -> None:
+    """Saját szál: MAV GTFS naponta (KT_MAV_GTFS_AT, Budapest) + induláskor, ha hiányzik / >24 óra."""
+    assert STATE is not None
+    if not mav_net_enabled():
+        log("mav_worker off (mock or KT_MAV_DISABLE)")
+        return
+    if STATE.stop.wait(float(os.environ.get("KT_MAV_START_DELAY", "40"))):
+        return
+    try:
+        hh, mm = [int(x) for x in MAV_GTFS_AT.split(":", 1)]
+    except Exception:
+        hh, mm = 4, 30
+    last_day = ""
+    m = mav_meta()
+    th: Optional[threading.Thread] = None
+    if not _mav_ready() or now_ms() - int(m.get("downloaded_at") or 0) > MAV_GTFS_MAX_AGE * 1000:
+        th = threading.Thread(target=mav_update, kwargs={"force": not _mav_ready()}, name="kt-mav-gtfs", daemon=True)
+        th.start()
+    bt = bud_now()
+    if bt.tm_hour * 60 + bt.tm_min >= hh * 60 + mm:
+        last_day = time.strftime("%Y-%m-%d", bt)
+    while not STATE.stop.is_set():
+        try:
+            bt = bud_now()
+            day = time.strftime("%Y-%m-%d", bt)
+            if day != last_day and bt.tm_hour * 60 + bt.tm_min >= hh * 60 + mm:
+                last_day = day
+                if th is None or not th.is_alive():
+                    th = threading.Thread(target=mav_update, name="kt-mav-gtfs", daemon=True)
+                    th.start()
+        except Exception:
+            log("mav_worker_error " + _mav_redact(traceback.format_exc().splitlines()[-1]))
+        STATE.stop.wait(30)
+
+
+def _mav_db() -> Optional[sqlite3.Connection]:
+    if not _mav_ready():
+        return None
+    return sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(MAV_GTFS_DB)), uri=True, timeout=5)
+
+
+def _mav_nodata() -> tuple[int, dict[str, Any]]:
+    st = mav_health()
+    code = "NO_CREDENTIALS" if "no-credentials" in st else ("AUTH_FAILED" if "auth-failed" in st else "NO_DATA")
+    return 503, {"status": code, "mav_gtfs": st, "text": {"NO_CREDENTIALS": "mav gtfs credentials not configured on the server",
+                                                          "AUTH_FAILED": "mav gtfs download rejected (credentials)",
+                                                          "NO_DATA": "mav gtfs not downloaded yet"}[code]}
+
+
+def _mav_ymd(params: dict[str, list[str]]) -> str:
+    d = (first(params, "date") or "").strip()
+    if re.fullmatch(r"\d{8}", d):
+        return d
+    return time.strftime("%Y%m%d", bud_now())
+
+
+def _mav_active_sids(conn: sqlite3.Connection, ymd: str) -> set:
+    try:
+        wd = time.strptime(ymd, "%Y%m%d").tm_wday
+    except ValueError:
+        return set()
+    bit = 1 << wd
+    return {r[0] for r in conn.execute("SELECT sid FROM mcal WHERE d0<=? AND d1>=? AND (days & ?)!=0", (ymd, ymd, bit))}
+
+
+def _mav_trip_head(conn: sqlite3.Connection, row: Any, sn: dict) -> dict[str, Any]:
+    tid, rid, sid, hs, shape, dep, arr, s0, s1, n, ag, short, long_, kind, num, name, typ, color = row
+    return {"tid": tid, "rid": rid, "num": num or "", "kind": kind or "", "name": name or "", "line": short or "",
+            "label": " ".join(x for x in ((kind + " " + num).strip() if num else "", short, name) if x) or long_ or tid,
+            "from": sn.get(s0, ""), "to": sn.get(s1, "") or hs, "hs": hs or "", "dep": dep, "arr": arr, "n": n,
+            "agency": ag, "bus": typ == 3, "color": color or "", "shape": bool(shape)}
+
+
+_MAV_TRIP_SQL = ("SELECT t.id,t.rid,t.sid,t.hs,t.shape,t.dep,t.arr,t.s0,t.s1,t.n,COALESCE(a.name,''),r.short,r.long,r.kind,r.num,r.name,r.typ,r.color "
+                 "FROM mtrip t JOIN mroute r ON r.id=t.rid LEFT JOIN magency a ON a.id=r.ag ")
+
+
+def mav_search(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    conn = _mav_db()
+    if conn is None:
+        return _mav_nodata()
+    try:
+        q = (first(params, "q") or "").strip()
+        if not q or len(q) > 40:
+            return 400, {"status": "BAD_REQUEST", "text": "q required (train number or line)"}
+        ymd = _mav_ymd(params)
+        lim = _int_param(params, "limit", 40, 1, 100)
+        act = _mav_active_sids(conn, ymd)
+        digits = re.findall(r"\d+", q)
+        letters = re.sub(r"[\d\s]+", " ", q).strip()
+        rids: list = []
+        how = ""
+        sh = conn.execute("SELECT id FROM mroute WHERE lower(short)=lower(?)", (q.replace(" ", ""),)).fetchall()
+        if sh:   # vonal (S60, Z72, G43, IR85 …) elsőként
+            rids, how = [r[0] for r in sh], "line"
+        if not rids and digits and len(digits) == 1 and re.fullmatch(r"(?:[^\W\d_][\w.]*\s*)?\d+", q, re.UNICODE):
+            num = digits[0]
+            cand = conn.execute("SELECT id,kind,short FROM mroute WHERE num=?", (num,)).fetchall()
+            if letters:
+                lf = _mav_fold(letters)
+                cand = [r for r in cand if _mav_fold(r[1]) == lf or _mav_fold(r[2]) == lf]
+            if cand:
+                rids, how = [r[0] for r in cand], "num"
+        if not rids and len(q) >= 3:
+            qf = "%" + _mav_fold(q) + "%"
+            rids, how = [r[0] for r in conn.execute("SELECT id FROM mroute WHERE nf LIKE ? LIMIT 3000", (qf,))], "name"
+        out = []
+        tot = other = 0
+        if rids:
+            marks = ",".join("?" * len(rids))
+            rows = conn.execute(_MAV_TRIP_SQL + "WHERE t.rid IN (" + marks + ") ORDER BY t.dep", rids).fetchall()
+            other = len(rows)
+            rows = [r for r in rows if r[2] in act]
+            other -= len(rows)
+            tot = len(rows)
+            rows = rows[:lim]
+            sids = {r[7] for r in rows} | {r[8] for r in rows}
+            sn = {}
+            if sids:
+                m2 = ",".join("?" * len(sids))
+                sn = {a: b for a, b in conn.execute("SELECT id,name FROM mstop WHERE id IN (" + m2 + ")", list(sids))}
+            out = [_mav_trip_head(conn, r, sn) for r in rows]
+        return 200, {"status": "OK", "now": now_ms(), "date": ymd, "q": q, "match": how, "total": tot, "other_days": other, "trips": out}
+    finally:
+        conn.close()
+
+
+def mav_trip(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    conn = _mav_db()
+    if conn is None:
+        return _mav_nodata()
+    try:
+        tid = (first(params, "tid") or "").strip()
+        if not tid or len(tid) > 64:
+            return 400, {"status": "BAD_REQUEST", "text": "tid required"}
+        r = conn.execute(_MAV_TRIP_SQL + "WHERE t.id=?", (tid,)).fetchone()
+        if not r:
+            return 404, {"status": "NOT_FOUND", "text": "unknown trip"}
+        ymd = _mav_ymd(params)
+        st = conn.execute("SELECT s.stop,COALESCE(p.name,''),p.lat,p.lon,s.arr,s.dep FROM mst s LEFT JOIN mstop p ON p.id=s.stop WHERE s.tid=? ORDER BY s.seq", (tid,)).fetchall()
+        sn = {x[0]: x[1] for x in st}
+        head = _mav_trip_head(conn, r, sn)
+        shp = conn.execute("SELECT p FROM mshape WHERE id=?", (r[4],)).fetchone() if r[4] else None
+        return 200, {"status": "OK", "now": now_ms(), "date": ymd, "active": r[2] in _mav_active_sids(conn, ymd), "trip": head,
+                     "stops": [[a, b, c, d, e, f] for a, b, c, d, e, f in st], "shape": shp[0] if shp else None}
+    finally:
+        conn.close()
+
+
+def mav_status() -> dict[str, Any]:
+    m = mav_meta()
+    keep = ("source", "downloaded_at", "checked_at", "last_result", "last_error", "size", "sha256", "download_sec", "index_sec",
+            "valid_from", "valid_to", "feed_version", "counts")
+    u, pw = mav_creds()
+    return {"status": "OK", "now": now_ms(), "mav_gtfs": mav_health(), "enabled": mav_net_enabled(), "credentials": bool(u and pw),
+            "schedule": {"daily_at": MAV_GTFS_AT + " Europe/Budapest"}, "gtfs": ({k: m.get(k) for k in keep} if m else None), "ready": _mav_ready()}
+
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2912,6 +3388,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(*volan_departures(params))
             if path == "/api/volan/trip":  # srv-volan4
                 return self._send_json(*volan_trip(params))
+            if path == "/api/mav/search":  # srv-mav1
+                return self._send_json(*mav_search(params))
+            if path == "/api/mav/trip":  # srv-mav1
+                return self._send_json(*mav_trip(params))
+            if path == "/api/mav/status":  # srv-mav1
+                return self._send_json(200, mav_status())
             if path == "/api/mavinform":
                 return self._send_json(*mavinform_query(params))
 
@@ -3041,6 +3523,7 @@ class Handler(BaseHTTPRequestHandler):
                 "poll_interval_sec": STATE.poll_interval,
                 "backoff": bo,
                 "key_configured": bool(STATE.api_key),
+                "mav-gtfs": mav_health(),
                 "features": SERVER_FEATURES,
             },
         )
@@ -3303,6 +3786,8 @@ def main() -> int:
     sl.start()
     vw = threading.Thread(target=volan_worker, name="kt-volan", daemon=True)
     vw.start()
+    mw = threading.Thread(target=mav_worker, name="kt-mav", daemon=True)
+    mw.start()
     httpd = ThreadingHTTPServer((BIND, PORT), Handler)
     log("listening http://%s:%s" % (BIND, PORT))
     try:
