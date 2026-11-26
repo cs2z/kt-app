@@ -81,7 +81,7 @@ SYNC_MAX_VALUE = int(os.environ.get("KT_SYNC_MAX_VALUE", "65536"))    # egy kulc
 SYNC_MAX_KEYS = int(os.environ.get("KT_SYNC_MAX_KEYS", "80"))
 SYNC_MAX_DOCS = int(os.environ.get("KT_SYNC_MAX_DOCS", "200"))
 SYNC_MIN_GAP_SEC = float(os.environ.get("KT_SYNC_MIN_GAP", "1.0"))    # írás / azonosító
-SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot", "volan-extra", "volan-tt"]
+SERVER_FEATURES = ["futar", "gtfs-rt", "fleet", "history", "auth", "sync", "lastknown", "offline", "volan-gtfs", "mavinform", "depot", "volan-extra", "volan-tt", "volan-trip"]
 
 # v1.22: utolsó ismert hely rendszámonként (plate_last – soha nem törlődik; a teljes nyomvonal fleet_history marad HISTORY_DAYS napig)
 LASTKNOWN_R_DEFAULT = 1500
@@ -1921,11 +1921,96 @@ def _volan_tt_ready() -> bool:
     try:
         c = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(VOLAN_GTFS_DB)), uri=True, timeout=5)
         try:
-            return bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vstop'").fetchone())
+            return _volan_has_v4(c)
         finally:
             c.close()
     except Exception:
         return False
+
+
+def _volan_has_v4(c: sqlite3.Connection) -> bool:
+    """srv-volan4: menet-megállók (vtst) + útvonalak (vshape) + kocsiállás (vdep.plat) is kell."""
+    n = c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('vstop','vtst','vshape')").fetchone()[0]
+    return n == 3
+
+
+# ---- srv-volan4: Google-polyline kódolás (1e-5 fok) + Douglas–Peucker egyszerűsítés (méterben) ----
+VOLAN_SHAPE_TOL_M = float(os.environ.get("KT_VOLAN_SHAPE_TOL_M") or "10")
+
+
+def _poly_enc(pts: list) -> str:
+    out = []
+    pa = pb = 0
+    for a, b in pts:
+        ia, ib = int(round(a * 1e5)), int(round(b * 1e5))
+        for v in (ia - pa, ib - pb):
+            v = ~(v << 1) if v < 0 else (v << 1)
+            while v >= 0x20:
+                out.append(chr((0x20 | (v & 0x1f)) + 63))
+                v >>= 5
+            out.append(chr(v + 63))
+        pa, pb = ia, ib
+    return "".join(out)
+
+
+def _poly_dec(s: str) -> list:
+    pts = []
+    i = a = b = 0
+    n = len(s)
+    while i < n:
+        vals = []
+        for _ in range(2):
+            sh = r = 0
+            while True:
+                c = ord(s[i]) - 63
+                i += 1
+                r |= (c & 0x1f) << sh
+                sh += 5
+                if c < 0x20:
+                    break
+            vals.append(~(r >> 1) if r & 1 else (r >> 1))
+        a += vals[0]
+        b += vals[1]
+        pts.append([a / 1e5, b / 1e5])
+    return pts
+
+
+def _dp_simplify(pts: list, tol: float) -> list:
+    n = len(pts)
+    if n < 3 or tol <= 0:
+        return pts
+    kx = 111320.0 * math.cos(math.radians(pts[0][0]))
+    ky = 110540.0
+    xy = [(q[1] * kx, q[0] * ky) for q in pts]
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    st = [(0, n - 1)]
+    t2 = tol * tol
+    while st:
+        a, b = st.pop()
+        if b <= a + 1:
+            continue
+        ax, ay = xy[a]
+        bx, by = xy[b]
+        dx, dy = bx - ax, by - ay
+        ll = dx * dx + dy * dy
+        mi, md = -1, t2
+        for i in range(a + 1, b):
+            px, py = xy[i]
+            if ll == 0:
+                d = (px - ax) ** 2 + (py - ay) ** 2
+            else:
+                t = ((px - ax) * dx + (py - ay) * dy) / ll
+                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                qx, qy = ax + t * dx - px, ay + t * dy - py
+                d = qx * qx + qy * qy
+            if d > md:
+                md, mi = d, i
+        if mi >= 0:
+            keep[mi] = True
+            st.append((a, mi))
+            st.append((mi, b))
+    return [q for q, k in zip(pts, keep) if k]
 
 
 def _gtfs_secs(t: str) -> Optional[int]:
@@ -1939,8 +2024,11 @@ def _gtfs_secs(t: str) -> Optional[int]:
 def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> dict[str, Any]:
     """Két folyamos menet a stop_times-on (memóriában csak menetenként 4 érték + a megállók szülő-állomása)."""
     par: dict[str, str] = {}
-    for sid, pa in conn.execute("SELECT id, parent FROM stops"):
+    plat: dict[str, str] = {}
+    for sid, pa, pc in conn.execute("SELECT id, parent, platform FROM stops"):
         par[sid] = pa or sid
+        if pc:
+            plat[sid] = pc
     rinfo: dict[str, tuple] = {}
     for rid, short, net in conn.execute("SELECT id, short, network FROM routes"):
         if VOLAN_TT_LOCAL or (net or "") != "local":
@@ -1949,7 +2037,7 @@ def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> 
     for r in rows("trips.txt"):
         rid = r.get("route_id") or ""
         if rid in rinfo:
-            trips[r.get("trip_id") or ""] = [rid, r.get("service_id") or "", (r.get("trip_headsign") or "").strip()]
+            trips[r.get("trip_id") or ""] = [rid, r.get("service_id") or "", (r.get("trip_headsign") or "").strip(), (r.get("shape_id") or "").strip()]
     ends: dict[str, list] = {}
     served: set = set()
     for r in rows("stop_times.txt"):
@@ -1974,18 +2062,47 @@ def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> 
     terms: set = set()
     for e in ends.values():
         terms.add(e[1]); terms.add(e[3])
-    conn.execute("CREATE TABLE vtrip(ix INTEGER PRIMARY KEY, id TEXT, route TEXT, short TEXT, service TEXT, hs TEXT, dest TEXT)")
+    conn.execute("CREATE TABLE vtrip(ix INTEGER PRIMARY KEY, id TEXT, route TEXT, short TEXT, service TEXT, hs TEXT, dest TEXT, shape TEXT)")
     names_by: dict[str, str] = dict(conn.execute("SELECT id, name FROM stops"))
     tix: dict[str, int] = {}
     tb = []
-    for i, (tid, (rid, svc, hs)) in enumerate(trips.items()):
+    shapes_used: set = set()
+    for i, (tid, (rid, svc, hs, shp)) in enumerate(trips.items()):
         if tid not in ends:
             continue
         tix[tid] = i
-        tb.append((i, tid, rid, rinfo[rid], svc, hs, names_by.get(ends[tid][3], "")))
-    conn.executemany("INSERT INTO vtrip VALUES(?,?,?,?,?,?,?)", tb)
+        if shp:
+            shapes_used.add(shp)
+        tb.append((i, tid, rid, rinfo[rid], svc, hs, names_by.get(ends[tid][3], ""), shp))
+    conn.executemany("INSERT INTO vtrip VALUES(?,?,?,?,?,?,?,?)", tb)
+    conn.execute("CREATE INDEX idx_vtrip_id ON vtrip(id)")
     del tb
-    conn.execute("CREATE TABLE vdep(term TEXT, dep INTEGER, trip INTEGER)")
+    conn.execute("CREATE TABLE vdep(term TEXT, dep INTEGER, trip INTEGER, plat TEXT)")
+    # srv-volan4: menetenként a teljes megállósor (zlib: "sorszám|stop_id|érk|ind|fel|le" sorok, stop_sequence szerint)
+    conn.execute("CREATE TABLE vtst(ix INTEGER PRIMARY KEY, z BLOB)")
+    import zlib
+    tsb: list = []
+    cur_ix = None
+    cur_rows: list = []
+    done_ix: set = set()
+    extra: dict[int, list] = {}
+    n_tst = 0
+
+    def _tst_flush() -> None:
+        nonlocal n_tst
+        if cur_ix is None or not cur_rows:
+            return
+        if cur_ix in done_ix:            # nem folytonos stop_times: utólag összefésüljük
+            extra.setdefault(cur_ix, []).extend(cur_rows)
+            return
+        done_ix.add(cur_ix)
+        cur_rows.sort(key=lambda x: x[0])
+        tsb.append((cur_ix, zlib.compress("\n".join(x[1] for x in cur_rows).encode("utf-8"), 6)))
+        n_tst += 1
+        if len(tsb) >= 2000:
+            conn.executemany("INSERT INTO vtst VALUES(?,?)", tsb)
+            tsb.clear()
+
     db: list = []
     nd: dict[str, int] = defaultdict(int)
     for r in rows("stop_times.txt"):
@@ -1995,6 +2112,18 @@ def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> 
             continue
         st = r.get("stop_id") or ""
         pst = par.get(st, st)
+        if ix != cur_ix:
+            _tst_flush()
+            cur_ix, cur_rows = ix, []
+        try:
+            sq0 = int(r.get("stop_sequence") or 0)
+        except ValueError:
+            sq0 = None
+        if sq0 is not None:
+            a0 = _gtfs_secs(r.get("arrival_time") or "")
+            d0 = _gtfs_secs(r.get("departure_time") or "")
+            cur_rows.append((sq0, "%s|%s|%s|%s|%s|%s" % (sq0, st, "" if a0 is None else a0, "" if d0 is None else d0,
+                                                     (r.get("pickup_type") or "").strip(), (r.get("drop_off_type") or "").strip())))
         if pst not in terms or (r.get("pickup_type") or "").strip() == "1":
             continue
         try:
@@ -2006,12 +2135,68 @@ def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> 
         d = _gtfs_secs(r.get("departure_time") or r.get("arrival_time") or "")
         if d is None:
             continue
-        db.append((pst, d, ix)); nd[pst] += 1
+        db.append((pst, d, ix, plat.get(st, ""))); nd[pst] += 1
         if len(db) >= 20000:
-            conn.executemany("INSERT INTO vdep VALUES(?,?,?)", db); db = []
+            conn.executemany("INSERT INTO vdep VALUES(?,?,?,?)", db); db = []
+    _tst_flush()
+    if tsb:
+        conn.executemany("INSERT INTO vtst VALUES(?,?)", tsb)
+        tsb.clear()
+    for ix, more in extra.items():   # nem folytonos stop_times: a teljes sor újrarendezése sorszám szerint
+        old = conn.execute("SELECT z FROM vtst WHERE ix = ?", (ix,)).fetchone()
+        allr = [(int(x.split("|", 1)[0]), x) for x in (zlib.decompress(old[0]).decode("utf-8").split("\n") if old else []) if x] + more
+        allr.sort(key=lambda x: x[0])
+        conn.execute("INSERT OR REPLACE INTO vtst VALUES(?,?)", (ix, zlib.compress("\n".join(x[1] for x in allr).encode("utf-8"), 6)))
+    del extra, done_ix, cur_rows
     if db:
-        conn.executemany("INSERT INTO vdep VALUES(?,?,?)", db)
+        conn.executemany("INSERT INTO vdep VALUES(?,?,?,?)", db)
     conn.execute("CREATE INDEX idx_vdep ON vdep(term, dep)")
+    # srv-volan4: útvonalak (csak a felhasznált shape-ek), Douglas–Peucker egyszerűsítve, polyline szövegként
+    conn.execute("CREATE TABLE vshape(id TEXT PRIMARY KEY, poly TEXT)")
+    n_shp = n_pts = n_pts_raw = 0
+    if "shapes.txt" in names and shapes_used:
+        import csv as _csv
+        import io as _io
+        shb: list = []
+        sdone: set = set()
+        with zf.open("shapes.txt") as raw:
+            rd = _csv.reader(_io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""))
+            hdr = next(rd, None) or []
+            try:
+                I, A, B, S = (hdr.index(k) for k in ("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"))
+            except ValueError:
+                I = -1
+            if I >= 0:
+                cur_s, buf = None, []
+
+                def _shp_flush() -> None:
+                    nonlocal n_shp, n_pts, n_pts_raw
+                    if cur_s is None or not buf or cur_s in sdone:
+                        return
+                    sdone.add(cur_s)
+                    buf.sort()
+                    pts = [(a, b) for _, a, b in buf]
+                    sp = _dp_simplify(pts, VOLAN_SHAPE_TOL_M)
+                    n_pts_raw += len(pts); n_pts += len(sp); n_shp += 1
+                    shb.append((cur_s, _poly_enc(sp)))
+                    if len(shb) >= 1000:
+                        conn.executemany("INSERT OR REPLACE INTO vshape VALUES(?,?)", shb)
+                        shb.clear()
+
+                for r in rd:
+                    if len(r) <= max(I, A, B, S):
+                        continue
+                    if r[I] != cur_s:
+                        _shp_flush()
+                        cur_s, buf = r[I], []
+                    if cur_s in shapes_used:
+                        try:
+                            buf.append((int(r[S]), float(r[A]), float(r[B])))
+                        except ValueError:
+                            pass
+                _shp_flush()
+        if shb:
+            conn.executemany("INSERT OR REPLACE INTO vshape VALUES(?,?)", shb)
     conn.execute("CREATE TABLE vstop(id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL, term INTEGER, ndep INTEGER)")
     sb = []
     for sid in served:
@@ -2043,7 +2228,8 @@ def _gtfs_build_tt(zf: Any, rows: Any, names: set, conn: sqlite3.Connection) -> 
     n_t = conn.execute("SELECT COUNT(*) FROM vstop WHERE term=1").fetchone()[0]
     n_s = conn.execute("SELECT COUNT(*) FROM vstop").fetchone()[0]
     n_d = conn.execute("SELECT COUNT(*) FROM vdep").fetchone()[0]
-    return {"terminals": n_t, "stops": n_s, "departures": n_d, "trips": len(tix), "local_included": VOLAN_TT_LOCAL}
+    return {"terminals": n_t, "stops": n_s, "departures": n_d, "trips": len(tix), "local_included": VOLAN_TT_LOCAL,
+            "trip_stops": n_tst, "shapes": n_shp, "shape_points": n_pts, "shape_points_raw": n_pts_raw}
 
 
 def gtfs_update(force: bool = False) -> bool:
@@ -2470,6 +2656,7 @@ def volan_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]
         t0 = int(_dt.datetime(d0.year, d0.month, d0.day, tzinfo=tz).timestamp())
         t1 = int((_dt.datetime(d0.year, d0.month, d0.day, tzinfo=tz) + _dt.timedelta(days=1, hours=4)).timestamp())
         lst = []
+        pcol = "d.plat" if _volan_has_v4(conn) else "''"
         for k in (-1, 0, 1):
             dd = d0 + _dt.timedelta(days=k)
             act = _volan_active(conn, dd.strftime("%Y%m%d"))
@@ -2477,17 +2664,97 @@ def volan_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]
                 continue
             base = int((_dt.datetime(dd.year, dd.month, dd.day, 12, tzinfo=tz)).timestamp()) - 12 * 3600   # GTFS: dél − 12 óra
             lo, hi = t0 - base, t1 - base
-            for dep, tid, rid, short, svc, hs, dest in conn.execute(
-                    "SELECT d.dep, t.id, t.route, t.short, t.service, t.hs, t.dest FROM vdep d JOIN vtrip t ON t.ix = d.trip "
+            sd = dd.strftime("%Y%m%d")
+            for dep, tid, rid, short, svc, hs, dest, pl in conn.execute(
+                    "SELECT d.dep, t.id, t.route, t.short, t.service, t.hs, t.dest, " + pcol + " FROM vdep d JOIN vtrip t ON t.ix = d.trip "
                     "WHERE d.term = ? AND d.dep >= ? AND d.dep < ?", (sid, lo, hi)):
                 if svc in act:
-                    lst.append([base + dep, short, dest or hs, tid, rid])
+                    lst.append([base + dep, short, dest or hs, tid, rid, pl or "", sd])
     finally:
         conn.close()
     lst.sort(key=lambda x: (x[0], x[1]))
     m = gtfs_meta()
     return 200, {"status": "OK", "now": now_ms(), "date": ymd, "stop": {"id": st[0], "name": st[1], "lat": st[2], "lon": st[3], "term": bool(st[4])},
-                 "feed_version": m.get("feed_version"), "fields": ["t", "ln", "dest", "trip", "route"], "n": len(lst[:3000]), "list": lst[:3000]}
+                 "feed_version": m.get("feed_version"), "fields": ["t", "ln", "dest", "trip", "route", "plat", "sd"], "n": len(lst[:3000]), "list": lst[:3000]}
+
+
+def volan_trip(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    """srv-volan4: egy menet menetrend szerinti megállósora (kocsiállással) és útvonala egy szolgáltatási napon."""
+    import datetime as _dt
+    import zlib
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/Budapest")
+    tid = (first(params, "trip") or "").strip()
+    if not tid or len(tid) > 120:
+        return 400, {"status": "ERROR", "text": "trip=<trip id>"}
+    ymd = (first(params, "date") or "").strip()
+    if not re.fullmatch(r"\d{8}", ymd or ""):
+        n = _dt.datetime.fromtimestamp(now_ms() / 1000, tz)
+        if n.hour < 3:
+            n -= _dt.timedelta(days=1)
+        ymd = n.strftime("%Y%m%d")
+    try:
+        d0 = _dt.date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8]))
+    except ValueError:
+        return 400, {"status": "ERROR", "text": "date=YYYYMMDD"}
+    conn = _volan_db()
+    if conn is None:
+        return 503, {"status": "NO_DATA", "text": "volan gtfs not downloaded yet"}
+    try:
+        if not _volan_has_v4(conn):
+            return 503, {"status": "NO_DATA", "text": "volan trip index not built yet"}
+        t = conn.execute("SELECT ix, id, route, short, service, hs, dest, shape FROM vtrip WHERE id = ?", (tid,)).fetchone()
+        if not t:
+            return 404, {"status": "NOT_FOUND", "text": "unknown trip"}
+        z = conn.execute("SELECT z FROM vtst WHERE ix = ?", (t[0],)).fetchone()
+        raw = zlib.decompress(z[0]).decode("utf-8").split("\n") if z else []
+        recs = []
+        for ln in raw:
+            q = ln.split("|")
+            if len(q) == 6:
+                recs.append(q[1:])
+        ids = sorted({q[0] for q in recs})
+        info: dict[str, tuple] = {}
+        for i in range(0, len(ids), 400):
+            ch = ids[i:i + 400]
+            for row in conn.execute("SELECT id, name, lat, lon, parent, platform FROM stops WHERE id IN (%s)" % ",".join("?" * len(ch)), ch):
+                info[row[0]] = row[1:]
+        pids = sorted({(info.get(q[0]) or ("", 0, 0, ""))[3] for q in recs} - {""})
+        pinfo: dict[str, tuple] = {}
+        for i in range(0, len(pids), 400):
+            ch = pids[i:i + 400]
+            for row in conn.execute("SELECT id, name, lat, lon FROM stops WHERE id IN (%s)" % ",".join("?" * len(ch)), ch):
+                pinfo[row[0]] = row[1:]
+        base = int(_dt.datetime(d0.year, d0.month, d0.day, 12, tzinfo=tz).timestamp()) - 12 * 3600
+        stops = []
+        for sid, a, d, pu, do in recs:
+            nm, la, lo, pa, pc = info.get(sid) or ("", None, None, "", "")
+            ta = base + int(a) if a else None
+            td = base + int(d) if d else None
+            stops.append([sid, pa or sid, nm, la, lo, pc or "", ta, td, pu, do])
+        shape = []
+        if t[7]:
+            sh = conn.execute("SELECT poly FROM vshape WHERE id = ?", (t[7],)).fetchone()
+            if sh and sh[0]:
+                shape = _poly_dec(sh[0])
+        act = _volan_active(conn, ymd)
+
+        def term(pid: str) -> Optional[dict]:
+            if not pid:
+                return None
+            x = pinfo.get(pid)
+            if x:
+                return {"id": pid, "name": x[0], "lat": x[1], "lon": x[2]}
+            y = next((s for s in stops if s[1] == pid), None)
+            return {"id": pid, "name": y[2], "lat": y[3], "lon": y[4]} if y else None
+    finally:
+        conn.close()
+    m = gtfs_meta()
+    return 200, {"status": "OK", "now": now_ms(), "date": ymd, "feed_version": m.get("feed_version"),
+                 "trip": {"id": t[1], "route": t[2], "ln": t[3], "hs": t[5], "dest": t[6] or t[5], "runs": t[4] in act,
+                          "from": term(stops[0][1]) if stops else None, "to": term(stops[-1][1]) if stops else None},
+                 "fields": ["stop", "station", "name", "lat", "lon", "plat", "arr", "dep", "pickup", "dropoff"],
+                 "stops": stops, "shape": shape}
 
 
 def mavinform_query(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
@@ -2643,6 +2910,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(*volan_map(params))
             if path == "/api/volan/departures":
                 return self._send_json(*volan_departures(params))
+            if path == "/api/volan/trip":  # srv-volan4
+                return self._send_json(*volan_trip(params))
             if path == "/api/mavinform":
                 return self._send_json(*mavinform_query(params))
 
