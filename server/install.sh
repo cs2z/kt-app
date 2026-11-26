@@ -182,6 +182,9 @@ install_helpers() {
   if [[ -f "$REPO_DIR/server/kt-update.sh" ]]; then
     install -m 0755 "$REPO_DIR/server/kt-update.sh" "$SBIN_DIR/kt-update"
   fi
+  if [[ -f "$REPO_DIR/server/kt-set-mav" ]]; then
+    install -m 0755 "$REPO_DIR/server/kt-set-mav" "$SBIN_DIR/kt-set-mav"
+  fi
 }
 
 # ---------- venv ----------
@@ -496,6 +499,7 @@ health_check() {
     warn "Helyben ellenőrizheted: curl -s http://127.0.0.1:8787/health"
   fi
   say "Később, ha a ktbp.hu DNS-e kész:  sudo kt-set-domain ktbp.hu"
+  say "Vasúti GTFS hozzáférés beállítása / cseréje:  sudo kt-set-mav"
   say "Kliens token megnézése:          sudo cat /etc/kt-server/client-token"
   say "A tokent, a BKK-kulcsot és a jelszavakat NE küldd chatbe."
   say "Visszajelzésnek elég: az URL és a /health válasz (OK / hibaüzenet)."

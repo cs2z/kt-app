@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Vasúti GTFS hozzáférés beállítása a KT szerveren: MAV_GTFS_USER / MAV_GTFS_PASSWORD
+# az /etc/kt-server/env-ben (a többi sor érintetlen), 0600 root:kt, majd systemctl restart kt-server.
+# Használat: sudo kt-set-mav
+# A jelszó csak a rejtett bekérésben (vagy a hívó környezetében) él; a parancs nem írja ki, nem naplózza.
+set -euo pipefail
+ENV_FILE="${KT_ENV_FILE:-/etc/kt-server/env}"
+APP_USER="${KT_APP_USER:-kt}"
+NO_RESTART="${KT_MAV_NO_RESTART:-0}"
+UNIT="${KT_SERVER_UNIT:-kt-server}"
+
+if [[ "${KT_SET_MAV_SKIP_ROOT:-0}" != "1" && "$(id -u)" -ne 0 ]]; then
+  echo "root kell: sudo kt-set-mav" >&2
+  exit 1
+fi
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "nincs $ENV_FILE – előbb a szerver telepítése (install.sh)." >&2
+  exit 1
+fi
+
+USER="${MAV_GTFS_USER:-}"
+PASS="${MAV_GTFS_PASSWORD:-}"
+if [[ -z "$USER" || -z "$PASS" ]]; then
+  if [[ "${KT_SET_MAV_NONINTERACTIVE:-0}" == "1" || ! -e /dev/tty ]]; then
+    echo "nincs /dev/tty (vagy nem interaktív mód), és MAV_GTFS_USER / MAV_GTFS_PASSWORD nincs beállítva." >&2
+    exit 1
+  fi
+  printf '%s\n' "Vasúti GTFS hozzáférés (a vonatkeresőhöz)." > /dev/tty
+  printf 'Felhasználó (e-mail): ' > /dev/tty
+  read -r USER < /dev/tty
+  printf 'Jelszó (nem látszik): ' > /dev/tty
+  read -r -s PASS < /dev/tty
+  printf '\n' > /dev/tty
+fi
+# a felhasználó körül vágjuk a szóközt; a jelszóét nem
+USER="${USER#"${USER%%[![:space:]]*}"}"
+USER="${USER%"${USER##*[![:space:]]}"}"
+if [[ -z "$USER" || -z "$PASS" ]]; then
+  echo "üres felhasználó vagy jelszó, nincs változás." >&2
+  exit 1
+fi
+if [[ "$USER" == *$'\n'* || "$USER" == *$'\r'* || "$PASS" == *$'\n'* || "$PASS" == *$'\r'* ]]; then
+  echo "a felhasználó vagy a jelszó nem tartalmazhat sortörést." >&2
+  exit 1
+fi
+
+export MAV_GTFS_USER="$USER" MAV_GTFS_PASSWORD="$PASS"
+python3 - "$ENV_FILE" << 'PY'
+import os, pathlib, sys, tempfile
+path = pathlib.Path(sys.argv[1])
+user, pw = os.environ["MAV_GTFS_USER"], os.environ["MAV_GTFS_PASSWORD"]
+text = path.read_text(encoding="utf-8")
+lines = [ln for ln in text.splitlines() if not ln.startswith("MAV_GTFS_USER=") and not ln.startswith("MAV_GTFS_PASSWORD=")]
+lines += ["MAV_GTFS_USER=" + user, "MAV_GTFS_PASSWORD=" + pw]
+out = "\n".join(lines) + "\n"
+fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env.")
+try:
+    os.write(fd, out.encode("utf-8"))
+    os.close(fd)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+    raise
+PY
+# a python gyerek után a változókat ebben a shellben sem hagyjuk tovább (a restart nem örökli ezt a környezetet)
+unset PASS USER MAV_GTFS_PASSWORD
+# USER name may still be needed? already written. unset both.
+unset MAV_GTFS_USER
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  chown "root:$APP_USER" "$ENV_FILE"
+fi
+chmod 0600 "$ENV_FILE"
+
+if [[ "$NO_RESTART" == "1" ]]; then
+  echo "A vasúti GTFS hozzáférés be van írva. Újraindítás kihagyva."
+else
+  systemctl restart "$UNIT"
+  echo "A vasúti GTFS hozzáférés be van írva, a kt-server újraindítva."
+fi
+echo "A hozzáférést NE küldd chatbe. Ellenőrzés: curl -s http://127.0.0.1:8787/health  (mav-gtfs: ok / …)."
