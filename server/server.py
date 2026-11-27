@@ -3392,6 +3392,7 @@ def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
             return 400, {"status": "BAD_REQUEST", "text": "name or lat+lon required"}
         ymd = _mav_ymd(params)
         lim = _int_param(params, "limit", 40, 1, 100)
+        frm = _int_param(params, "from", 0, 0, 172800)  # srv-mav4: csak az ennél (mp, éjféltől) nem korábbi indulások
         found = _mav_find_stops(conn, name, lat, lon)
         if not found:
             return 200, {"status": "OK", "now": now_ms(), "date": ymd, "name": name, "match": "none",
@@ -3416,6 +3417,8 @@ def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
                 continue
             if head_row[2] not in act:
                 continue
+            if int(sdep) < frm:
+                continue
             head = _mav_trip_head(conn, head_row, sn)
             head["dep"] = int(sdep)
             items.append(head)
@@ -3423,7 +3426,7 @@ def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         tot = len(items)
         out = items[:lim]
         return 200, {"status": "OK", "now": now_ms(), "date": ymd, "name": name, "match": how,
-                     "lat": lat, "lon": lon,
+                     "lat": lat, "lon": lon, "from": frm,
                      "stops": [{"id": a, "name": b, "lat": c, "lon": d} for a, b, c, d in found],
                      "total": tot, "trips": out}
     finally:
