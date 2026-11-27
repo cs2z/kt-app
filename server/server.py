@@ -2977,6 +2977,7 @@ def _mav_build_index(zpath: Path, db_tmp: Path) -> dict[str, Any]:
             if buf:
                 c.executemany("INSERT INTO mst VALUES (?,?,?,?,?)", buf)
             c.execute("CREATE INDEX mst_t ON mst(tid, seq)")
+            c.execute("CREATE INDEX IF NOT EXISTS mst_stop ON mst(stop)")
             # menet-összegzés: első indulás, utolsó érkezés, végpontok, megállószám
             c.execute("""UPDATE mtrip SET
                 dep=(SELECT dep FROM mst WHERE mst.tid=mtrip.id ORDER BY seq LIMIT 1),
@@ -3286,6 +3287,149 @@ def mav_trip(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         conn.close()
 
 
+_MAV_STOP_IDX = {"ok": False}
+_MAV_STOP_LOCK = threading.Lock()
+_MAV_DEP_SQL = (
+    "SELECT t.id,t.rid,t.sid,t.hs,t.shape,t.dep,t.arr,t.s0,t.s1,t.n,COALESCE(a.name,''),r.short,r.long,r.kind,r.num,r.name,r.typ,r.color,"
+    "s.dep,s.arr,s.stop,s.seq "
+    "FROM mst s JOIN mtrip t ON t.id=s.tid JOIN mroute r ON r.id=t.rid LEFT JOIN magency a ON a.id=r.ag "
+    "WHERE s.stop IN ({marks}) AND s.dep IS NOT NULL"
+)
+
+
+def _mav_dist_m(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+    r = math.pi / 180.0
+    x = (b_lon - a_lon) * r * math.cos((a_lat + b_lat) / 2.0 * r)
+    y = (b_lat - a_lat) * r
+    return math.sqrt(x * x + y * y) * 6371000.0
+
+
+def _mav_norm_stop(s: str) -> str:
+    t = fold(s)
+    for suf in (" vasutallomas", " palyaudvar", " railway station", " train station"):
+        if t.endswith(suf):
+            t = t[:-len(suf)].rstrip()
+    return " ".join(t.split())
+
+
+def _mav_name_hit(q: str, nm: str) -> bool:
+    a, b = _mav_norm_stop(q), _mav_norm_stop(nm)
+    if not a or not b:
+        return False
+    if a == b or a.replace(" ", "").replace("-", "") == b.replace(" ", "").replace("-", ""):
+        return True
+    return b.startswith(a + " ") or b.startswith(a + "-")
+
+
+def _mav_ensure_stop_index() -> None:
+    if _MAV_STOP_IDX["ok"] or not _mav_ready():
+        return
+    with _MAV_STOP_LOCK:
+        if _MAV_STOP_IDX["ok"] or not _mav_ready():
+            return
+        try:
+            conn = sqlite3.connect(str(MAV_GTFS_DB), timeout=10)
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS mst_stop ON mst(stop)")
+                conn.commit()
+            finally:
+                conn.close()
+            _MAV_STOP_IDX["ok"] = True
+        except Exception:
+            log("mav_index_mst_stop " + _mav_redact((traceback.format_exc().splitlines() or [""])[-1]))
+
+
+def _mav_float(params: dict[str, list[str]], name: str) -> Optional[float]:
+    v = (first(params, name) or "").strip().replace(",", ".")
+    if not v:
+        return None
+    try:
+        x = float(v)
+    except ValueError:
+        return None
+    if not math.isfinite(x):
+        return None
+    return x
+
+
+def _mav_find_stops(conn: sqlite3.Connection, name: str, lat: Optional[float], lon: Optional[float]) -> list:
+    rows = conn.execute("SELECT id,name,lat,lon FROM mstop").fetchall()
+    named = [r for r in rows if name and _mav_name_hit(name, r[1] or "")]
+    have_ll = lat is not None and lon is not None
+    if named:
+        if have_ll:
+            named = sorted(named, key=lambda r: _mav_dist_m(lat, lon, float(r[2] or 0), float(r[3] or 0)))
+            best = named[0]
+            d0 = _mav_dist_m(lat, lon, float(best[2] or 0), float(best[3] or 0))
+            if d0 <= 1500:
+                return [r for r in named if _mav_dist_m(float(best[2] or 0), float(best[3] or 0), float(r[2] or 0), float(r[3] or 0)) <= 400]
+        return named
+    if have_ll:
+        near = []
+        for r in rows:
+            if r[2] is None or r[3] is None:
+                continue
+            d = _mav_dist_m(lat, lon, float(r[2]), float(r[3]))
+            if d <= 100:
+                near.append((d, r))
+        near.sort(key=lambda x: x[0])
+        return [r for _, r in near]
+    return []
+
+
+def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    """Állomási indulók a vasúti GTFS-ből (név + koordináta, adott nap aktív service, időrend, limit)."""
+    conn = _mav_db()
+    if conn is None:
+        return _mav_nodata()
+    try:
+        _mav_ensure_stop_index()
+        name = (first(params, "name") or "").strip()
+        if len(name) > 80:
+            return 400, {"status": "BAD_REQUEST", "text": "name too long"}
+        lat, lon = _mav_float(params, "lat"), _mav_float(params, "lon")
+        if not name and (lat is None or lon is None):
+            return 400, {"status": "BAD_REQUEST", "text": "name or lat+lon required"}
+        ymd = _mav_ymd(params)
+        lim = _int_param(params, "limit", 40, 1, 100)
+        found = _mav_find_stops(conn, name, lat, lon)
+        if not found:
+            return 200, {"status": "OK", "now": now_ms(), "date": ymd, "name": name, "match": "none",
+                         "lat": lat, "lon": lon, "stops": [], "total": 0, "trips": []}
+        how = "name+coord" if name and lat is not None and lon is not None else ("name" if name else "coord")
+        ids = [r[0] for r in found]
+        act = _mav_active_sids(conn, ymd)
+        sql = _MAV_DEP_SQL.format(marks=",".join("?" * len(ids)))
+        rows = conn.execute(sql, ids).fetchall()
+        sids = {r[7] for r in rows} | {r[8] for r in rows}
+        sn: dict[str, str] = {}
+        if sids:
+            m2 = ",".join("?" * len(sids))
+            sn = {a: b for a, b in conn.execute("SELECT id,name FROM mstop WHERE id IN (" + m2 + ")", list(sids))}
+        items = []
+        for row in rows:
+            head_row = row[:18]
+            sdep, sarr, sstop = row[18], row[19], row[20]
+            if sdep is None:
+                continue
+            if sstop == head_row[8]:  # a viszonylat utolsó megállója: csak érkezés
+                continue
+            if head_row[2] not in act:
+                continue
+            head = _mav_trip_head(conn, head_row, sn)
+            head["dep"] = int(sdep)
+            items.append(head)
+        items.sort(key=lambda t: (t["dep"], t.get("tid") or ""))
+        tot = len(items)
+        out = items[:lim]
+        return 200, {"status": "OK", "now": now_ms(), "date": ymd, "name": name, "match": how,
+                     "lat": lat, "lon": lon,
+                     "stops": [{"id": a, "name": b, "lat": c, "lon": d} for a, b, c, d in found],
+                     "total": tot, "trips": out}
+    finally:
+        conn.close()
+
+
 def mav_status() -> dict[str, Any]:
     m = mav_meta()
     keep = ("source", "downloaded_at", "checked_at", "last_result", "last_error", "size", "sha256", "download_sec", "index_sec",
@@ -3394,6 +3538,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(*mav_trip(params))
             if path == "/api/mav/status":  # srv-mav1
                 return self._send_json(200, mav_status())
+            if path == "/api/mav/departures":  # srv-mav3
+                return self._send_json(*mav_departures(params))
             if path == "/api/mavinform":
                 return self._send_json(*mavinform_query(params))
 
