@@ -3677,6 +3677,45 @@ html body.kdesk .krmnv.krmpn.krmpn .qdst .qdnav{flex-wrap:wrap!important}
 .krmnv .krmpl{flex:1 0 100%;font:700 11px/1.2 var(--mono,monospace);color:#9fb0c6}
 .krmnv .krmpc{font:700 10px/1 var(--mono,monospace);color:#9fb0c6;margin:0 4px 0 -2px}
 .mapwrap>.msr>.krmtw{padding:2px 8px 4px}
+
+/* ===== v1.87 (t1152u–t1154u): a jobb oldali egységes oszlop színe és formája = a régi mobil jobb oszlopé (v1.93) =====
+   Különálló kerek gombok saját neon gyűrűvel, közös háttér-panel nélkül; a régi mobil színek: Lenyit / + / − ciánkék (#00e5ff),
+   Vissza kék (#29b6ff) a régi, kitöltött „9+” jelvénnyel; a + / − a régi betűtípussal; AUTO felirat a régi arányban.
+   A méret a --krms-ből (telefonon 44 px, 6 px köz, mint a régi mobilon; asztalon a magasságból számolt méret, arányosan). */
+html body.kdesk .kctl>.krmcol{background:none!important;border:0!important;box-shadow:none!important;border-radius:0!important}
+html body.kdesk .kctl>.krmcol>div>:is(.krmt,.leaflet-control-zoom-in,.leaflet-control-zoom-out){--nc:#00e5ff!important;--ng:0,229,255!important}
+html body.kdesk .kctl>.krmcol>div>#navBack{--nc:#29b6ff!important;--ng:41,182,255!important}
+html body.kdesk .kctl>.krmcol>div>:is(.leaflet-control-zoom-in,.leaflet-control-zoom-out){font:700 calc(var(--krms) * 24 / 44)/1 system-ui,sans-serif!important}
+html body.kdesk .kctl>.krmcol>div>button.kauto{font-size:calc(var(--krms) * 10.5 / 44)!important}
+html body.kdesk .kctl>.krmcol>div>#navBack>i{top:-4px;right:-4px;min-width:calc(var(--krms) * .41);height:calc(var(--krms) * .41);padding:0 calc(var(--krms) * .09);box-sizing:border-box;border-radius:2px;
+ background:#29b6ff;border:1.5px solid #000;color:#000;font:900 calc(var(--krms) * .25)/calc(var(--krms) * .41) var(--mono,monospace);font-style:normal;text-align:center;text-shadow:none}
+
+/* t1155u/t1156u – KÖZÖS (asztal + telefon): Volán menet-csempe: legfeljebb 250 px és a jobb oszlopig, a cél „…”-tal vágva, 30 px magas, kocsiállás szám szögletes keretben */
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"]{height:30px;max-width:min(250px,calc(100vw - var(--kjtr,62px) - 14px))}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"]>.kjtx{min-width:0;overflow:hidden}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"] :is(.kjtn,.kjmd,.kjfl){flex:0 0 auto}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"] .kjln{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"] .kjfl.kjtpl{display:inline-flex;align-items:center}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"] .kjfl.kjtpl>i.k71pl{border-radius:0;height:18px;min-width:18px;font-size:11.5px}
+/* t1159u: a menet-csempe a jobb menü-oszlop fölött; ▾ = összecsukás kis gombbá (csak a 🚌 jel), bökésre újra csempe */
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"]{z-index:1700!important}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"]>.kjtmb{flex:0 0 auto;align-self:center;display:flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0 4px 0 0;padding:0;box-sizing:border-box;border:1.5px solid #5ce1ff;border-radius:50%;background:rgba(0,20,30,.9);color:#5ce1ff;font:900 10px/1 Roboto,Arial,sans-serif;box-shadow:0 0 5px rgba(92,225,255,.6);cursor:pointer}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"].kjtmin{width:30px!important;min-width:30px;max-width:30px}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"].kjtmin>:not(.kjeu){display:none!important}
+html body.kdesk .mapwrap .kjt[data-p^="T:N~"].kjtmin>.kjeu{flex:1 1 auto;font-size:15px}
+
+/* t1157u – KÖZÖS (asztal + telefon): óra + szerver-jelző az iránytű mellett; a jobb oszlop lenyíló része az oszlopon belül görgethető */
+html body.kdesk .mapwrap .leaflet-top.leaflet-right>.kctl>:is(.kclk,.ksrv).ktop{position:absolute!important;margin:0!important;right:auto!important;bottom:auto!important;white-space:nowrap}
+html body.kdesk .kctl>.krmcol:not(.ktopsc){overflow:visible!important}
+html body.kdesk .kctl>.krmcol.ktopsc{overflow-y:auto!important;touch-action:pan-y}
+html body.kdesk .kctl>.krmcol.ktopsc>.krmexp{overflow:visible}
+html body.kdesk .kctl>.krmcol>.krmexp{box-sizing:border-box;width:calc(100% + 8px);padding:5px 4px;margin:-5px -4px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;scrollbar-width:none;flex:0 1 auto!important}
+html body.kdesk .kctl>.krmcol>.krmexp::-webkit-scrollbar{display:none}
+html body.kdesk .kctl>.krmcol{-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
+html body.kdesk .kctl>.krmcol.ktpdrag{outline:2px dashed rgba(0,229,255,.8);outline-offset:3px;border-radius:12px;cursor:grabbing}
+/* az elhúzott oszlop a többi térkép-vezérlő (iránytű, óra) fölött legyen, hogy mindig bökhető maradjon */
+html body.kdesk .leaflet-top.leaflet-right:has(>.kctl>.krmcol.ktpmv){z-index:1010}
+html body.kdesk .kctl>.krmcol.ktpdrag,html body.kdesk .kctl>.krmcol.ktpdrag *{touch-action:none!important}
 </style></head><body class="kdesk"><style id="k112css">
 /* ===== v1.12: mobil panel-skin a v0.6 „KT·TARTALÉK” mintájára (csak mobil, csak nem-térképes panelek) ===== */
 body:not(.kdesk):not(#k112){--k6-card:linear-gradient(180deg,rgba(14,26,44,.92) 0%,rgba(6,12,22,.94) 100%);--k6-edge:rgba(120,200,255,.18);--k6-edge2:rgba(120,210,255,.40)}
@@ -15233,5 +15272,74 @@ document.addEventListener('click',e=>{const t=e.target.closest&&e.target.closest
  const el=t.closest('.msr'),inp=el.querySelector('.msrin'),q=KRMT.q;KRMT.q='';KRMT.d='';el.querySelectorAll(':scope>.krmtw').forEach(x=>x.remove());if(!q||!inp)return;
  inp.value=q;try{MS.q=q}catch(_){}inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}))},true);
 document.addEventListener('input',e=>{const i=e.target;if(!i||!i.classList||!i.classList.contains('msrin')||!e.isTrusted)return;if(i.value.trim()){KRMT.q='';KRMT.d='';const el=i.closest('.msr');if(el)el.querySelectorAll(':scope>.krmtw').forEach(x=>x.remove())}},true);
+
+/* t1155u/t1156u – KÖZÖS (asztal + telefon, azonos kód): Volán menet-csempe (T:N~) keskenyebb (a cél „…”-tal vágódik, nem lóg a jobb gombokba),
+   kocsiállás „k.” nélkül, csak a szám szögletes keretben (a meglévő i.k71pl kocsiállás-jel), kicsit magasabb (24 → 30 px). Csak ez a csempe-fajta változik.
+   t1159u: a csempe mindig a jobb menü-gombok FÖLÖTT (z-sorrend), és tovább csukható kis gombbá (▾ gomb a csempén; a kis gombra bökve újra csempe). */
+if(typeof kjTileHtml==='function')kjTileHtml=(o=>function(p){const h=o.apply(this,arguments);if(String(p).indexOf('T:N~')!==0||typeof h!=='string')return h;
+ return h.replace(/<span class="kjfl">k\.([^<]*)<\/span>/,(m,n)=>'<span class="kjfl kjtpl"><i class="k71pl" title="kocsiállás '+n+'">'+n+'</i></span>').replace('<button type="button" class="k51x k71x"','<button type="button" class="kjtmb" aria-label="Csempe összecsukása kis gombbá" title="Csempe összecsukása kis gombbá">▾</button><button type="button" class="k51x k71x"')})(kjTileHtml);
+/* összecsukott állapot csempénként (a csempe újrarajzolásakor is megmarad) */
+const KJTM={m:{},a:''};
+document.addEventListener('pointerdown',e=>{const t=e.target&&e.target.closest&&e.target.closest('.mapwrap .kjt[data-p^="T:N~"]');KJTM.a='';if(!t)return;
+ if(e.target.closest('.kjtmb'))KJTM.a='min:'+t.dataset.p;else if(t.classList.contains('kjtmin'))KJTM.a='max:'+t.dataset.p},true);
+function kjtMinSync(){document.querySelectorAll('.mapwrap .kjt[data-p^="T:N~"]').forEach(t=>{const m=!!KJTM.m[t.dataset.p];if(t.classList.contains('kjtmin')!==m){t.classList.toggle('kjtmin',m);
+  t.setAttribute('aria-label',m?'Menet-csempe kinyitása':t.dataset.p+' – részletek');t.title=m?'Menet-csempe ('+((t.querySelector('.kjtn')||{}).textContent||'')+') – bökés: kinyitás':''}})}
+if(typeof k71Load==='function')k71Load=(o=>function(){const a=KJTM.a;if(a){KJTM.a='';const p=a.slice(4);if(a.indexOf('min:')===0){KJTM.m[p]=1;kjtMinSync();return}if(a.indexOf('max:')===0){delete KJTM.m[p];kjtMinSync();return}}
+ return o.apply(this,arguments)})(k71Load);
+function kjtFit(){const c=document.querySelector('.kctl>.krmcol');if(!c||!c.getClientRects().length)return;const cl=c.getBoundingClientRect().left-((typeof KTP!=='undefined'&&KTP.x)||0)/* az oszlop eredeti (nem elhúzott) helye */,B=document.body,v=Math.max(8,Math.round(innerWidth-cl+6))+'px';
+ if(B.style.getPropertyValue('--kjtr')!==v)B.style.setProperty('--kjtr',v);
+}/* t1160u: a csempe a gombok fölé kerülhet (átfedés megengedett) – nincs automatikus elléptetés, csak a szélesség-korlát */
+setInterval(()=>{try{kjtMinSync();kjtFit()}catch(e){}},300);
+
+/* t1157u – KÖZÖS (asztal + telefon, azonos kód):
+   1) a nagy óra a SZERVER/KÖZVETLEN jelzővel együtt a bal felső iránytű mellé kerül (az óra az iránytűtől jobbra, a jelző az óra mellett, nem takarja az iránytűt);
+   2) a jobb menü-oszlop felcsúszik a felszabadult helyre;
+   2b) t1158u/t1159u: az oszlop áthelyezhető: hosszú nyomás (0,45 s) az oszlop bármely gombján, majd húzás (a sima bökés ugyanúgy működik);
+       a képernyőn belül marad, a helye localStorage-ban (kt.krmpos.v1); visszaállítás: az eredeti helye közelébe (24 px) visszahúzva odaugrik és a mentés törlődik;
+   3) a lenyíló rész az oszlopon belül görgethető (függőlegesen), a fix rész mindig látszik – mint a régi mobil kapszula alul. */
+function ktopRect(e){return e&&e.getClientRects().length?e.getBoundingClientRect():null}
+function ktopClock(){const kc=document.querySelector('.mapwrap .leaflet-top.leaflet-right>.kctl');if(!kc)return;const ck=kc.querySelector(':scope>.kclk'),sv=kc.querySelector(':scope>.ksrv');
+ const map=kc.closest('.leaflet-container'),k=map&&(map.querySelector('a.krot')||map.querySelector('.leaflet-top.leaflet-left .leaflet-control'));const kr=ktopRect(k);if(!kr||!ck)return;
+ [ck,sv].forEach(e=>{if(e&&!e.classList.contains('ktop'))e.classList.add('ktop')});
+ const kq=kc.getBoundingClientRect(),cr=ktopRect(ck);if(!cr)return;
+ const set=(e,x,y)=>{const l=Math.round(x)+'px',t=Math.round(y)+'px';if(e.style.left!==l)e.style.left=l;if(e.style.top!==t)e.style.top=t};
+ const cx=kr.right+8,cy=kr.top+(kr.height-cr.height)/2;set(ck,cx-kq.left,cy-kq.top);
+ const sr=ktopRect(sv);if(sv&&sr)set(sv,cx+cr.width+6-kq.left,kr.top+(kr.height-sr.height)/2-kq.top)}
+if(typeof krmPlace==='function')krmPlace=(o=>function(col){const r=o.apply(this,arguments);try{const fx=col.querySelector(':scope>.krmfix'),ex=col.querySelector(':scope>.krmexp'),mh=parseFloat(col.style.maxHeight);
+ if(fx&&ex&&mh){const G=parseFloat(col.style.getPropertyValue('--krmg'))||KRM.G||3,S=KRM.S||40,room=Math.floor(mh-fx.offsetHeight-G-2),sc=room<S;/* ha a lenyíló részből egy gomb sem férne el (pl. fekvő telefon), az egész oszlop görget – mint a régi mobil kapszula */
+  col.classList.toggle('ktopsc',sc);const v=sc?'none':(room+10)+'px';if(ex.style.maxHeight!==v)ex.style.maxHeight=v}
+ col.classList.toggle('kmpsc',false)}catch(e){}return r})(krmPlace);
+function ktopRun(){try{ktopClock()}catch(e){}try{const c=document.querySelector('.kctl>.krmcol');if(c&&typeof krmPlace==='function'){const t=c.getBoundingClientRect().top;if(KRM._ktt!==t){KRM._ktt=t;krmPlace(c)}}}catch(e){}}
+setInterval(ktopRun,300);addEventListener('resize',()=>setTimeout(ktopRun,50));
+/* ---- 2b) oszlop-húzás: hosszú nyomás + húzás; mentés kt.krmpos.v1; az eredeti hely közelébe ejtve visszaáll ---- */
+const KTP={k:'kt.krmpos.v1',x:0,y:0,ax:0,ay:0,on:0,t:0,sx:0,sy:0,ox:0,oy:0,sup:0};
+try{const v=JSON.parse(localStorage.getItem(KTP.k)||'null');if(v&&isFinite(v.x)&&isFinite(v.y)){KTP.x=+v.x;KTP.y=+v.y}}catch(e){}
+function ktpCol(){return document.querySelector('.kctl>.krmcol')}
+function ktpApply(){const c=ktpCol();if(!c)return;c.style.translate='none';const v=(KTP.x||KTP.y)?'translate('+Math.round(KTP.x)+'px,'+Math.round(KTP.y)+'px)':'';
+ if(c.style.transform!==v)c.style.transform=v;KTP.ax=v?Math.round(KTP.x):0;KTP.ay=v?Math.round(KTP.y):0;c.classList.toggle('ktpmv',!!(KTP.x||KTP.y))}
+function ktpClamp(){const c=ktpCol();if(!c||!c.getClientRects().length)return;const r=c.getBoundingClientRect(),hx=r.left-KTP.ax,hy=r.top-KTP.ay/* az eredeti hely = a látszó hely − a ténylegesen alkalmazott eltolás */,S=KRM.S||40;
+ KTP.x=Math.min(Math.max(KTP.x,4-hx),innerWidth-r.width-4-hx);KTP.y=Math.min(Math.max(KTP.y,4-hy),innerHeight-3*S-hy)}
+function ktpSave(){try{if(KTP.x||KTP.y)localStorage.setItem(KTP.k,JSON.stringify({x:Math.round(KTP.x),y:Math.round(KTP.y)}));else localStorage.removeItem(KTP.k)}catch(e){}}
+function ktopColReset(){KTP.x=0;KTP.y=0;ktpApply();ktpSave()}
+function ktpStart(x,y){KTP.on=2;KTP.ox=KTP.x;KTP.oy=KTP.y;KTP.sx=x;KTP.sy=y;const c=ktpCol();if(c){c.classList.add('ktpdrag');try{if(KTP.pid!=null)c.setPointerCapture(KTP.pid)}catch(e){}}try{navigator.vibrate&&navigator.vibrate(15)}catch(e){}}
+function ktpMove(x,y){KTP.x=KTP.ox+x-KTP.sx;KTP.y=KTP.oy+y-KTP.sy;ktpClamp();ktpApply()}
+function ktpEnd(){const c=ktpCol();if(c){c.classList.remove('ktpdrag');try{if(KTP.pid!=null&&c.hasPointerCapture(KTP.pid))c.releasePointerCapture(KTP.pid)}catch(e){}}KTP.pid=null;KTP.on=0;KTP.sup=Date.now();if(Math.hypot(KTP.x,KTP.y)<24){KTP.x=0;KTP.y=0}ktpApply();ktpSave();try{krmPlace(c)}catch(e){}}
+function ktpDown(x,y){clearTimeout(KTP.t);KTP.on=1;KTP.sx=x;KTP.sy=y;KTP.t=setTimeout(()=>{if(KTP.on===1)ktpStart(KTP.sx,KTP.sy)},450)}
+document.addEventListener('touchstart',e=>{const c=e.target.closest&&e.target.closest('.kctl>.krmcol');if(!c||e.touches.length!==1)return;KTP.pid=null;ktpDown(e.touches[0].clientX,e.touches[0].clientY)},{capture:true,passive:true});
+document.addEventListener('touchmove',e=>{if(!KTP.on)return;const t=e.touches[0];if(KTP.on===1){if(Math.hypot(t.clientX-KTP.sx,t.clientY-KTP.sy)>8){clearTimeout(KTP.t);KTP.on=0}return}
+ if(e.cancelable)e.preventDefault();e.stopPropagation();ktpMove(t.clientX,t.clientY)},{capture:true,passive:false});
+document.addEventListener('touchend',e=>{clearTimeout(KTP.t);if(KTP.on===2){if(e.cancelable)e.preventDefault();ktpEnd()}else KTP.on=0},{capture:true,passive:false});
+document.addEventListener('touchcancel',()=>{clearTimeout(KTP.t);if(KTP.on===2)ktpEnd();KTP.on=0},true);
+document.addEventListener('pointerdown',e=>{if(e.pointerType==='touch'||e.button!==0)return;const c=e.target.closest&&e.target.closest('.kctl>.krmcol');if(!c)return;KTP.pid=e.pointerId;ktpDown(e.clientX,e.clientY)},true);
+window.addEventListener('pointermove',e=>{if(e.pointerType==='touch'||!KTP.on)return;if(KTP.on===1){if(Math.hypot(e.clientX-KTP.sx,e.clientY-KTP.sy)>8){clearTimeout(KTP.t);KTP.on=0}return}
+ e.preventDefault();e.stopPropagation();ktpMove(e.clientX,e.clientY)},true);
+window.addEventListener('pointerup',e=>{if(e.pointerType==='touch')return;clearTimeout(KTP.t);if(KTP.on===2)ktpEnd();else KTP.on=0},true);
+window.addEventListener('pointercancel',e=>{if(e.pointerType==='touch')return;clearTimeout(KTP.t);if(KTP.on===2)ktpEnd();else KTP.on=0},true);
+/* a húzás végén a gombra eső „click” nem fut le */
+window.addEventListener('click',e=>{if(Date.now()-KTP.sup<400&&e.target.closest&&e.target.closest('.kctl>.krmcol')){e.preventDefault();e.stopImmediatePropagation()}},true);
+/* egérrel a natív „drag & drop” (link / kijelölés) megszakítaná a húzást */
+document.addEventListener('dragstart',e=>{if(KTP.on||(e.target.closest&&e.target.closest('.kctl>.krmcol')))e.preventDefault()},true);
+window.addEventListener('contextmenu',e=>{if(e.target.closest&&e.target.closest('.kctl>.krmcol'))e.preventDefault()},true);
+setInterval(()=>{try{if(KTP.on!==2&&(KTP.x||KTP.y)){const ox=KTP.x,oy=KTP.y;ktpClamp();if(ox!==KTP.x||oy!==KTP.y)ktpSave()}ktpApply()}catch(e){}},300);
 
 </script></body></html>
