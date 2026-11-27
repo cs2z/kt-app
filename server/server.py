@@ -2873,6 +2873,20 @@ def _mav_ready() -> bool:
         return False
 
 
+def _mav_has_tsn() -> bool:
+    """srv-mav5: az index tartalmazza-e a trip_short_name táblát (mtsn). Régi indexnél False → a napi frissítés újraindexel."""
+    if not MAV_GTFS_DB.exists():
+        return False
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(MAV_GTFS_DB)), uri=True, timeout=5)
+        try:
+            return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mtsn'").fetchone() is not None
+        finally:
+            c.close()
+    except Exception:
+        return False
+
+
 def mav_health() -> str:
     """ok / no-credentials / downloading / no-data / disabled / error:<Típus> / auth-failed"""
     m = mav_meta()
@@ -2925,6 +2939,7 @@ def _mav_build_index(zpath: Path, db_tmp: Path) -> dict[str, Any]:
             CREATE TABLE mtrip(id TEXT PRIMARY KEY, rid TEXT, sid TEXT, hs TEXT, shape TEXT, dep INT, arr INT, s0 TEXT, s1 TEXT, n INT);
             CREATE TABLE mst(tid TEXT, seq INT, stop TEXT, arr INT, dep INT);
             CREATE TABLE mshape(id TEXT PRIMARY KEY, p TEXT, n INT);
+            CREATE TABLE mtsn(tid TEXT PRIMARY KEY, tsn TEXT);
         """)
         with zipfile.ZipFile(str(zpath)) as zf:
             names = set(zf.namelist())
@@ -2959,9 +2974,14 @@ def _mav_build_index(zpath: Path, db_tmp: Path) -> dict[str, Any]:
             c.executemany("INSERT OR REPLACE INTO mcal VALUES (?,?,?,?)", cal)
             c.executemany("INSERT OR REPLACE INTO mstop VALUES (?,?,?,?)",
                           [(r["stop_id"], (r.get("stop_name") or "").strip(), float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0)) for r in rows("stops.txt")])
-            tr = [(r["trip_id"], r["route_id"], r.get("service_id") or "", (r.get("trip_headsign") or "").strip(), (r.get("shape_id") or "").strip())
-                  for r in rows("trips.txt")]
+            tr, tsn = [], []
+            for r in rows("trips.txt"):
+                tr.append((r["trip_id"], r["route_id"], r.get("service_id") or "", (r.get("trip_headsign") or "").strip(), (r.get("shape_id") or "").strip()))
+                ts = (r.get("trip_short_name") or "").strip()
+                if ts:
+                    tsn.append((r["trip_id"], ts[:20]))
             c.executemany("INSERT OR REPLACE INTO mtrip(id,rid,sid,hs,shape) VALUES (?,?,?,?,?)", tr)
+            c.executemany("INSERT OR REPLACE INTO mtsn VALUES (?,?)", tsn)  # srv-mav5: vonatszám (trip_short_name), ha a feed adja
             buf = []
             for r in rows("stop_times.txt"):
                 try:
@@ -3107,7 +3127,7 @@ def mav_update(force: bool = False) -> bool:
                 f.write(b)
         sha = h.hexdigest()
         dl_sec = round(now() - t0, 1)
-        if not force and sha == old.get("sha256") and _mav_ready():
+        if not force and sha == old.get("sha256") and _mav_ready() and _mav_has_tsn():
             old.update({"checked_at": now_ms(), "last_result": "unchanged", "last_error": None})
             _json_write_atomic(MAV_GTFS_META, old)
             log("mav_gtfs unchanged size=%s sec=%s" % (size, dl_sec))
@@ -3400,6 +3420,12 @@ def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         how = "name+coord" if name and lat is not None and lon is not None else ("name" if name else "coord")
         ids = [r[0] for r in found]
         act = _mav_active_sids(conn, ymd)
+        try:  # srv-mav5: az előző nap 24:00 utáni indulásai a kért napon (dep - 86400)
+            prev_ymd = time.strftime("%Y%m%d", time.localtime(time.mktime(time.strptime(ymd, "%Y%m%d")) - 12 * 3600))
+        except (ValueError, OverflowError):
+            prev_ymd = ""
+        act_prev = _mav_active_sids(conn, prev_ymd) if prev_ymd else set()
+        has_tsn = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mtsn'").fetchone() is not None
         sql = _MAV_DEP_SQL.format(marks=",".join("?" * len(ids)))
         rows = conn.execute(sql, ids).fetchall()
         sids = {r[7] for r in rows} | {r[8] for r in rows}
@@ -3415,16 +3441,27 @@ def mav_departures(params: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
                 continue
             if sstop == head_row[8]:  # a viszonylat utolsó megállója: csak érkezés
                 continue
-            if head_row[2] not in act:
-                continue
-            if int(sdep) < frm:
-                continue
-            head = _mav_trip_head(conn, head_row, sn)
-            head["dep"] = int(sdep)
-            items.append(head)
+            for prevday, d in ((False, int(sdep)), (True, int(sdep) - 86400)):
+                if prevday:
+                    if d < 0 or head_row[2] not in act_prev:
+                        continue
+                elif head_row[2] not in act:
+                    continue
+                if d < frm:
+                    continue
+                head = _mav_trip_head(conn, head_row, sn)
+                head["dep"] = d
+                if prevday:
+                    head["prevday"] = True
+                items.append(head)
         items.sort(key=lambda t: (t["dep"], t.get("tid") or ""))
         tot = len(items)
         out = items[:lim]
+        if has_tsn and out:
+            tids = list({t["tid"] for t in out})
+            tm = {a: b for a, b in conn.execute("SELECT tid,tsn FROM mtsn WHERE tid IN (" + ",".join("?" * len(tids)) + ")", tids)}
+            for t in out:
+                t["tsn"] = tm.get(t["tid"], "")
         return 200, {"status": "OK", "now": now_ms(), "date": ymd, "name": name, "match": how,
                      "lat": lat, "lon": lon, "from": frm,
                      "stops": [{"id": a, "name": b, "lat": c, "lon": d} for a, b, c, d in found],
